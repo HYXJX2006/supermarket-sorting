@@ -1,0 +1,54 @@
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+id_rsa*
+
+# Docker images and installers
+环境/
+*.tar
+*.tar.gz
+*.tgz
+*.iso
+*.exe
+
+# Generated data, caches and local runtime state
+baseline/debug_data/
+tmp_pdf_extract/
+**/__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.swp
+
+# Backups and editor/system files
+*.bak
+*.backup
+*.orig
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Large model/checkpoint and 3D asset binaries; keep manifests/download notes in Git
+*.pt
+*.pth
+*.onnx
+*.ply
+*.obj
+*.stl
+*.glb
+*.gltf
+
+# Historical patch snapshots
+*.before-*
+.gitignore.before-*
+
+
+# Temporary local probes
+baseline/_temp_*.py
+*.prelegacy
+
