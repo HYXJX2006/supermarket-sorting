@@ -7,6 +7,11 @@ module, avoiding nested __main__ execution and rclpy monkey-patching.
 """
 from __future__ import annotations
 
+# Allow sibling development helpers mounted under /workspace/baseline to be imported.
+import os as _bootstrap_os
+import sys as _bootstrap_sys
+_bootstrap_sys.path.insert(0, _bootstrap_os.path.dirname(__file__))
+
 import importlib.util
 import json
 import os
