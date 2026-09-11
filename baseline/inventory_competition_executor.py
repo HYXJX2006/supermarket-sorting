@@ -85,9 +85,20 @@ PITCH_SCAN = (
     (float(os.getenv("SUPERMARKET_PITCH_LOWER", "-0.70")), "lower"),
 )
 PITCH_DWELL_S = float(os.getenv("SUPERMARKET_PITCH_DWELL_S", "4.0"))
-DELIVERY_GOAL = (-1.88, -2.80, -math.pi / 2.0)   # 配送区北缘内侧放置站位（referee delivery_base）
+# 配送站位参数化：桌子(delivery_table)中心 (-1.940,-3.410)，桌面南缘 y=-3.19。
+# 原站位 y=-2.80 时车头离桌沿仅 ~0.09m（实测"离桌子太近"）；外移到 y=-2.55。
+DELIVERY_GOAL = (
+    _env_float("SUPERMARKET_DELIVERY_GOAL_X", -1.94),
+    _env_float("SUPERMARKET_DELIVERY_GOAL_Y", -2.55),
+    math.radians(_env_float("SUPERMARKET_DELIVERY_GOAL_YAW_DEG", -90.0)),
+)   # 配送区北缘内侧放置站位（referee delivery_base）
 DELIVERY_BASE_X = (-2.420, -1.460)
 DELIVERY_BASE_Y = (-3.880, -2.620)
+# 检测坐标吸附到最近同类货位的半径：覆盖实测 8cm 误差，同时小于相邻货位
+# 间距（同层 0.22m / 同列 0.33m）的一半，避免吸到隔壁。
+SLOT_SNAP_RADIUS = _env_float("SUPERMARKET_SLOT_SNAP_RADIUS", 0.13)
+# creep 失败后的重对准重试次数（回退 10cm 后重新 deploy→creep）
+CREEP_RETRY_MAX = int(_env_float("SUPERMARKET_CREEP_RETRY_MAX", 2))
 NAV_GOAL_TOPIC_EXEC = NAV_GOAL_TOPIC
 DEFAULT_MAPPING_SPEED = 0.35   # 货架前巡游扫描安全低速
 DEFAULT_CRUISE_SPEED = 1.2     # 长直 clear 段（去配送/返程）巡航速度
@@ -100,7 +111,7 @@ TRACK_STABILITY_WINDOW = max(6, _env_int("SUPERMARKET_TRACK_STABILITY_WINDOW", 8
 
 # 动作 worker 表：脚本 + 固定参数（参照 single_item_executor.WORKER_SCRIPTS 的 spawn 约定）。
 # 这些 worker 只控制机械臂/夹爪/升降柱，不控底盘；底盘由本 executor 独占。
-ARM_ACTIONS = ("safe_pose", "deploy", "creep", "close_gripper", "lift", "retreat")
+ARM_ACTIONS = ("safe_pose", "deploy", "creep", "close_gripper", "lift", "retreat", "slide_reset")
 POST_PLACE_SAFE_POSE = "post_place_safe_pose"
 WORKER_CFG = {
     "safe_pose": ("safe_arm_controller.py", ["safe_pose", "--execute", "--confirm", "safe_pose", "--timeout", "90"]),
@@ -109,9 +120,39 @@ WORKER_CFG = {
     "close_gripper": ("close_gripper_controller.py", ["--execute", "--confirm", "close_gripper", "--timeout", "120"]),
     "lift": ("lift_controller.py", ["--execute", "--confirm", "lift", "--timeout", "120"]),
     "retreat": ("retreat_controller.py", ["--execute", "--confirm", "retreat", "--timeout", "120"]),
+    # creep 失败后的小幅回退（10cm），用于重对准重试——不是正常撤出的 0.55m
+    "backoff": ("retreat_controller.py", ["--execute", "--confirm", "retreat", "--distance", "0.10", "--timeout", "60"]),
+    # 高层抓取后机身（slide）复位到安全巡航高度：否则保持 0.87 高位去配送，
+    # 机身+机械臂会撞料框桌沿（主人实测观察）。
+    "slide_reset": ("slide_reset_controller.py", ["--execute", "--confirm", "slide_reset", "--timeout", "30"]),
     "place": ("place_controller.py", ["--execute", "--confirm", "place", "--timeout", "30"]),
     "post_place_safe_pose": ("safe_arm_controller.py", ["post_place_safe_pose", "--execute", "--confirm", "post_place_safe_pose", "--timeout", "90"]),
 }
+
+def _load_slot_truth(layout_path: Path) -> list[dict[str, object]]:
+    """45 货位真值表：商品必定位于其中之一，用于校正 YOLO+RGB-D 的检测坐标。
+
+    比赛流程用检测定位（标定用布局真值），实测末端对位误差可达 8cm，而 creep
+    的 x 容差只有 7cm —— 吸附到最近同类货位可把精度提到 ±1cm。
+    """
+    slots: list[dict[str, object]] = []
+    try:
+        with open(layout_path, encoding="utf-8") as handle:
+            for entry in json.load(handle):
+                wp = entry.get("world_position")
+                if not wp or len(wp) < 3:
+                    continue
+                slots.append(
+                    {
+                        "slot": f"{entry.get('shelf', '')}/{entry.get('level', '')}/{entry.get('column', '')}",
+                        "kind": str(entry.get("object_kind", "")).strip().lower(),
+                        "world": tuple(float(v) for v in wp[:3]),
+                    }
+                )
+    except (OSError, ValueError):
+        return []
+    return slots
+
 
 @dataclass
 class Track:
@@ -299,6 +340,10 @@ class InventoryCompetitionExecutor(Node):
             world = (float(p.x), float(p.y), float(p.z))
             if not all(math.isfinite(v) for v in world):
                 continue
+            # 吸附到最近同类货位真值：消除检测抖动（实测最大 8cm）
+            snapped = self._snap_to_slot(kind, world)
+            if snapped is not None:
+                world = snapped
             tracks = self.tracks[kind]
             match = None
             best = 0.16
@@ -314,6 +359,22 @@ class InventoryCompetitionExecutor(Node):
                 tracks.append(match)
             match.samples.append((now, world, confidence))
             match.last_seen = now
+
+    def _snap_to_slot(self, kind: str, world: tuple[float, float, float]) -> tuple[float, float, float] | None:
+        """把检测坐标吸附到最近的同类货位真值；无同类货位或距离过远则不吸附。"""
+        if not self.slot_truth:
+            return None
+        kind_key = str(kind).strip().lower()
+        best: tuple[float, float, float] | None = None
+        best_distance = SLOT_SNAP_RADIUS
+        for slot in self.slot_truth:
+            if slot["kind"] != kind_key:
+                continue
+            slot_world = slot["world"]
+            distance = math.sqrt(sum((world[i] - slot_world[i]) ** 2 for i in range(3)))
+            if distance < best_distance:
+                best_distance, best = distance, slot_world
+        return best
 
     def _stable_world(self, track: Track, *, after: float | None = None) -> tuple[tuple[float, float, float], float, int] | None:
         now = time.monotonic()
@@ -727,10 +788,13 @@ class InventoryCompetitionExecutor(Node):
         nav_avoid_clearance = 0.30 if planned_delivery else 0.55
         nav_goal_tolerance = (
             0.18
-            if planned_delivery
+            if self.phase == "deliver"
+            # return_route_active（place 后返回货架）的终点就是下一目标的
+            # 预抓取线，必须用严格容差——此前它误用 0.18 宽容差，随后又
+            # 要过 0.05 的 pregrasp odom 门禁，0.09m 的停车误差必然被拒。
             else (
                 PREGRASP_GOAL_TOLERANCE
-                if self.phase in {"target_nav", "pregrasp_nav"}
+                if self.phase in {"target_nav", "pregrasp_nav"} or self.return_route_active
                 else 0.12
             )
         )
@@ -1586,7 +1650,18 @@ class InventoryCompetitionExecutor(Node):
             return
         self.arm_worker = None
         if code != 0:
-            self._fail_current(f"动作阶段 {ARM_ACTIONS[self.arm_index] if self.arm_index < len(ARM_ACTIONS) else 'place'} 失败")
+            action_now = ARM_ACTIONS[self.arm_index] if self.arm_index < len(ARM_ACTIONS) else "place"
+            if action_now == "creep" and self.creep_retry < CREEP_RETRY_MAX:
+                self.creep_retry += 1
+                self.get_logger().warning(
+                    f"[exec] creep 未对准，重对准重试 {self.creep_retry}/{CREEP_RETRY_MAX}："
+                    "回退 10cm 后重新 deploy→creep"
+                )
+                # -1 是让随后的 backoff 成功后 arm_index+1 正好落在 deploy
+                self.arm_index = ARM_ACTIONS.index("deploy") - 1
+                self._spawn_arm("backoff")
+                return
+            self._fail_current(f"动作阶段 {action_now} 失败")
             return
         completed_action = ARM_ACTIONS[self.arm_index] if self.arm_index < len(ARM_ACTIONS) else "unknown"
         if self.stop_after_close and completed_action == "close_gripper":

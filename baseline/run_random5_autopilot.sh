@@ -42,8 +42,8 @@ HEADLESS="${SUPERMARKET_HEADLESS:-0}"      # 0=显示 X11 窗口
 USE_GS="${SUPERMARKET_USE_GS:-1}"          # 1=3DGS实时画面；0=MuJoCo native
 GS_BATCH_RENDER="${SUPERMARKET_GS_BATCH_RENDER:-1}"
 RENDER_FPS="${SUPERMARKET_RENDER_FPS:-6}"
-GS_HEAD_ONLY="${SUPERMARKET_GS_HEAD_ONLY:-1}"
-GS_ASYNC="${SUPERMARKET_GS_ASYNC:-1}"
+GS_HEAD_ONLY="${SUPERMARKET_GS_HEAD_ONLY:-1}"   # 1=仅头部+第三人称走 GS；开 0(手眼也 GS) 会把异步渲染线程压满，相机帧率崩溃导致检测凑不齐槽位（实测 observed=0/45）
+GS_ASYNC="${SUPERMARKET_GS_ASYNC:-1}"          # 1=异步渲染保帧率；第三人称已由 simulator 补丁纳入批量（两全）
 ARM_PREGRASP_Y="${SUPERMARKET_ARM_PREGRASP_Y:-2.35}"
 ARM_ODOM_STABLE_SAMPLES="${SUPERMARKET_ARM_ODOM_STABLE_SAMPLES:-5}"
 PLAN_GATE_TIMEOUT="${SUPERMARKET_PLAN_GATE_TIMEOUT:-60}"
@@ -54,11 +54,11 @@ MAP_CONFIDENCE="${SUPERMARKET_MAP_CONFIDENCE:-0.25}"
 # 网关地址作为 Windows 宿主机；优先使用 WSL 默认路由网关，
 # /etc/resolv.conf 中的 nameserver 只是 DNS，不一定能承载 X11。
 # 也可显式传 X11_DISPLAY=192.168.x.x:0.0。
-X11_HOST="${X11_HOST:-$(ip route show default 2>/dev/null | awk '{print $3; exit}')}"
-if [[ -z "$X11_HOST" ]]; then
-  X11_HOST="$(awk '/^nameserver[[:space:]]/ {print $2; exit}' /etc/resolv.conf)"
-fi
-X11_DISPLAY="${X11_DISPLAY:-${X11_HOST}:0.0}"
+# X11 显示：默认走 WSLg 的 unix socket（:0 + /tmp/.X11-unix 挂载）——
+# 与 run_item_grasp.sh 同款，实测可靠。此前默认 VcXsrv TCP（NAT 网关:0.0）
+# 在 MUJOCO_GL=glfw 下 GLX 握手失败（gladLoadGL error → Server 崩、odom 断流、
+# executor 死等建图）。如坚持 VcXsrv 可显式传 X11_DISPLAY=192.168.x.x:0.0。
+X11_DISPLAY="${X11_DISPLAY:-:0}"
 SERVER_NAME="random5_autopilot_server"
 CLIENT_NAME="random5_autopilot_client"
 
@@ -91,7 +91,12 @@ unset SUPERMARKET_FIXED_BASELINE SUPERMARKET_FIXED_TARGET_SLOT \
 echo "==> 清理旧容器"
 docker rm -f "$SERVER_NAME" "$CLIENT_NAME" >/dev/null 2>&1 || true
 
-echo "==> 启动 3D 可视化 Server (X11=$X11_DISPLAY, USE_GS=$USE_GS, HEADLESS=$HEADLESS)"
+echo "# 容器 Python 是 3.10，会优先读 baseline/__pycache__/*.cpython-310.pyc。
+# :ro 挂载只阻止写新缓存，不阻止读旧缓存；源码改了而 .pyc 陈旧时会静默用旧
+# 字节码——夹空检测/门禁修复曾因此完全不生效（lift 照跑旧逻辑）。
+find "$ROOT/baseline/__pycache__" -name '*.cpython-310.pyc' -delete 2>/dev/null || true
+
+==> 启动 3D 可视化 Server (X11=$X11_DISPLAY, USE_GS=$USE_GS, HEADLESS=$HEADLESS)"
 docker run -d --name "$SERVER_NAME" --gpus all --network host --ipc host \
   -e ROS_DOMAIN_ID="$DOMAIN" \
   -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
@@ -99,6 +104,7 @@ docker run -d --name "$SERVER_NAME" --gpus all --network host --ipc host \
   -e MUJOCO_GL="${MUJOCO_GL:-glfw}" \
   -e QT_X11_NO_MITSHM=1 \
   -e LIBGL_ALWAYS_INDIRECT="${LIBGL_ALWAYS_INDIRECT:-0}" \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
   -e SUPERMARKET_HEADLESS="$HEADLESS" \
   -e SUPERMARKET_ENABLE_RENDER="${SUPERMARKET_ENABLE_RENDER:-1}" \
   -e SUPERMARKET_ENABLE_LIDAR="${SUPERMARKET_ENABLE_LIDAR:-1}" \

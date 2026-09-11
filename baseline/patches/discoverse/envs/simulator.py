@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 import threading
 import time
 import traceback
@@ -476,19 +477,47 @@ class SimulatorBase:
         obs_cam_ids = sorted(set(self.config.obs_rgb_cam_id + self.config.obs_depth_cam_id))
         if not obs_cam_ids or not hasattr(self, "gs_renderer"):
             return
+        # 第三人称（free camera，id=-1）纳入异步批量渲染：GUI 窗口的
+        # display_result 取自 batch_render_results[display_cam_id]，不加入
+        # 则第三人称回退原生网格渲染（三视角真实感要求）。
+        include_free = (not self.config.headless) and self.window is not None and hasattr(self, "free_camera")
         with self._gs_render_lock:
             if self._gs_render_thread is not None and self._gs_render_thread.is_alive():
                 return
             body_ids = np.asarray(self.gs_renderer.gs_body_ids, dtype=np.int32)
             body_pos = self.mj_data.xpos[body_ids].copy()
             body_quat = self.mj_data.xquat[body_ids].copy()
-            cam_ids = np.asarray(obs_cam_ids, dtype=np.int32)
+            cam_ids = list(obs_cam_ids)
             cam_pos = self.mj_data.cam_xpos[cam_ids].copy()
             cam_xmat = self.mj_data.cam_xmat[cam_ids].copy()
             fovy = self.mj_model.cam_fovy[cam_ids].copy()
+            if include_free:
+                fc = self.free_camera
+                az = math.radians(fc.azimuth)
+                el = math.radians(fc.elevation)
+                forward = np.array([
+                    math.cos(el) * math.cos(az),
+                    math.cos(el) * math.sin(az),
+                    math.sin(el),
+                ])
+                fc_pos = np.asarray(fc.lookat, dtype=float) - forward * float(fc.distance)
+                zaxis = -forward
+                up = np.array([0.0, 0.0, 1.0])
+                xaxis = np.cross(up, zaxis)
+                xaxis /= max(float(np.linalg.norm(xaxis)), 1e-9)
+                yaxis = np.cross(zaxis, xaxis)
+                fc_xmat = np.column_stack([xaxis, yaxis, zaxis])
+                fc_fovy = float(getattr(self.mj_model.vis.global_, "fovy", 45.0))
+                cam_ids = cam_ids + [-1]
+                # mj_data.cam_xmat 每行是 3x3 的展平（9 元素），free camera
+                # 需同样展平后再 vstack（否则维度 9 vs 3 不匹配）。
+                cam_pos = np.vstack([cam_pos, fc_pos.reshape(1, 3)])
+                cam_xmat = np.vstack([cam_xmat, fc_xmat.reshape(1, 9)])
+                fovy = np.append(fovy, fc_fovy)
+            cam_id_arr = np.asarray(cam_ids, dtype=np.int32)
             self._gs_render_thread = threading.Thread(
                 target=self._async_gs_render_worker,
-                args=(body_pos, body_quat, cam_pos, cam_xmat, fovy, render_width, render_height, obs_cam_ids),
+                args=(body_pos, body_quat, cam_pos, cam_xmat, fovy, render_width, render_height, cam_id_arr),
                 name="gs-render",
                 daemon=True,
             )

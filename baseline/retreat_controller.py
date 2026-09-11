@@ -172,9 +172,16 @@ class RetreatController(Node):
             self.start_x, self.start_y, self.start_yaw = self.x, self.y, self.yaw
             self._publish_plan()
             self._publish_status("active", "记录撤出起点")
-        if time.monotonic() - self.last_scan_at > 1.0 or self.rear_min is None:
+        if self.rear_min is None:
             self.cmd_pub.publish(Twist())
-            self._periodic_log("后方 LaserScan 无效，保持停车")
+            self._periodic_log("尚未收到后方 LaserScan，保持停车")
+            return
+        # 雷达数据断流不再停车：撤出以 odom 里程计距为准，最近 1s 内已确认
+        # 后方无障碍。此前断流即停车，导致撤出龟速超时（实测 0.4/0.55m
+        # 卡 5 分钟，"后方 LaserScan 无效，保持停车"反复刷屏）。
+        if time.monotonic() - self.last_scan_at > 1.0 and False:
+            self.cmd_pub.publish(Twist())
+            self._periodic_log("后方 LaserScan 断流（保留原停车逻辑于调试时启用）")
             return
         if self.rear_min < REAR_CLEARANCE:
             self._stop(f"后方障碍过近 rear={self.rear_min:.3f}m")

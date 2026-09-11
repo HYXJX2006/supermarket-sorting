@@ -79,6 +79,7 @@ class LiftController(Node):
         self.kind = ""
         self.grip_close = GRIP_CLOSE
         self.grip_feedback_max = GRIP_CLOSED_FEEDBACK_MAX
+        self.grip_feedback_min = 0.0
         # 是否已收到 grasp_goal_meta。类别门禁必须等它到达才可靠。
         self.meta_received = False
         self.meta_warned = False
@@ -102,6 +103,7 @@ class LiftController(Node):
             geometry = geometry_for_kind(self.kind)
             self.grip_close = float(geometry.grip_close)
             self.grip_feedback_max = float(geometry.grip_feedback_max)
+            self.grip_feedback_min = float(getattr(geometry, "grip_feedback_min", 0.0) or 0.0)
             self.meta_received = True
             self.get_logger().info(
                 f"收到抓取元数据：kind={self.kind!r} "
@@ -267,6 +269,22 @@ class LiftController(Node):
                 )
                 self.done = True
                 return
+            # 夹空检测（下限）：feedback 低于类别下限 = 指头越过商品闭到指令
+            # 位置，手里没有东西。比赛流程靠它避免"空手配送"——random5 实测
+            # heweidao 夹空 feedback=0.37/0.22（正常夹住 0.94-0.99）。
+            grip_min = float(getattr(self, "grip_feedback_min", 0.0) or 0.0)
+            fb = self.joints.get("right_arm_eef_gripper_joint")
+            if grip_min > 0.0 and fb is not None and fb < grip_min:
+                self._publish_status(
+                    "failed",
+                    f"夹空检测：feedback={fb:.4f} 低于下限 {grip_min:.3f}，商品未入指间",
+                )
+                self.get_logger().error(
+                    f"夹空检测：feedback={fb:.4f} < grip_feedback_min={grip_min:.3f}，"
+                    "商品不在指间，拒绝执行 lift（避免空手配送）"
+                )
+                self.done = True
+                return
             self.motion_started = True
         if not self._gripper_closed():
             feedback = self.joints.get("right_arm_eef_gripper_joint")
@@ -274,6 +292,19 @@ class LiftController(Node):
             self.get_logger().error(
                 f"夹爪尚未达到闭合安全范围：feedback={feedback} "
                 f"threshold={self.grip_feedback_max:.3f}，拒绝执行 lift"
+            )
+            self.done = True
+            return
+        grip_min = float(getattr(self, "grip_feedback_min", 0.0) or 0.0)
+        fb = self.joints.get("right_arm_eef_gripper_joint")
+        if grip_min > 0.0 and fb is not None and fb < grip_min:
+            self._publish_status(
+                "failed",
+                f"夹空检测：feedback={fb:.4f} 低于下限 {grip_min:.3f}，商品未入指间",
+            )
+            self.get_logger().error(
+                f"夹空检测：feedback={fb:.4f} < grip_feedback_min={grip_min:.3f}，"
+                "商品不在指间，拒绝执行 lift（避免空手配送）"
             )
             self.done = True
             return

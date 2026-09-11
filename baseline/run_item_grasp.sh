@@ -53,6 +53,7 @@ TOLERATE_CREEP_TIMEOUT="${TOLERATE_CREEP_TIMEOUT:-0}"
 # 抓取姿态：side=水平侧夹（默认）/ top=倒置俯抓咬顶棱。
 # top 用于 zhijin 等横向对距(85mm)>开口(80mm)的商品——咬棱距离与 yaw 无关，
 # 免去拨动改朝向。咬棱原理同 maidong 预压：过行程 5mm 硬咬顶棱。
+USE_GS="${USE_GS:-0}"                    # 1=3DGS 高斯泼溅真实感渲染（GPU+GLFW 下开）
 GRASP_ROT_MODE="${GRASP_ROT_MODE:-side}"
 TOP_GRASP_DZ="${TOP_GRASP_DZ:-0.05}"     # top 咬棱高度（相对商品中心）
 TOP_HOVER_DZ="${TOP_HOVER_DZ:-0.16}"     # top 悬停高度（商品正上方）
@@ -134,7 +135,7 @@ docker run -d --name "$SERVER_NAME" $GPU_ARGS --network host --ipc host \
   -e LIBGL_ALWAYS_INDIRECT=0 \
   -e SUPERMARKET_HEADLESS="$HEADLESS" \
   -e SUPERMARKET_ENABLE_RENDER=1 -e SUPERMARKET_ENABLE_LIDAR=1 \
-  -e SUPERMARKET_USE_GS=0 \
+  -e SUPERMARKET_USE_GS="$USE_GS" \
   -e SUPERMARKET_FIXED_BASELINE=1 -e SUPERMARKET_RANDOMIZE=0 \
   -e SUPERMARKET_RANDOMIZE_OBSTACLES=0 \
   -e SUPERMARKET_TASKS="$TARGET_ID" \
@@ -171,7 +172,7 @@ run_client() {
   local name="$1"; shift
   docker run --rm --name "$name" --network host --ipc host \
     -e ROS_DOMAIN_ID="$DOMAIN" -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
-    -e SUPERMARKET_FIXED_BASELINE=1 -e SUPERMARKET_RANDOMIZE=0 -e SUPERMARKET_USE_GS=0 \
+    -e SUPERMARKET_FIXED_BASELINE=1 -e SUPERMARKET_RANDOMIZE=0 -e SUPERMARKET_USE_GS="$USE_GS" \
     -v "$ROOT/baseline:/workspace/baseline:ro" \
     "$IMAGE_CLIENT" bash -lc "source /opt/ros/humble/setup.bash && $*"
 }

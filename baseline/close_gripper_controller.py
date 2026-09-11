@@ -49,6 +49,7 @@ class CloseGripperController(Node):
         self.joints: dict[str, float] = {}
         self.kind = ""
         self.grip_close = GRIP_CLOSE
+        self.geometry = None
 
         self.right_pub = self.create_publisher(Float64MultiArray, RIGHT_ARM_TOPIC, 10)
         self.plan_pub = self.create_publisher(String, PLAN_TOPIC, 10)
@@ -65,7 +66,8 @@ class CloseGripperController(Node):
         try:
             payload = json.loads(message.data)
             self.kind = str(payload.get("kind", "")).strip().lower()
-            self.grip_close = float(geometry_for_kind(self.kind).grip_close)
+            self.geometry = geometry_for_kind(self.kind)
+            self.grip_close = float(self.geometry.grip_close)
         except (TypeError, ValueError, json.JSONDecodeError):
             return
 
@@ -163,6 +165,23 @@ class CloseGripperController(Node):
         # Match the official client: hold the close target for the configured
         # interval, then advance. Feedback is reported for diagnostics only.
         if elapsed >= self.hold_seconds:
+            # 夹空检测：feedback 低于类别下限 = 指头越过商品闭到指令位，
+            # 手里没有东西。比赛流程靠这一步避免"空手配送"——未加 min 前
+            # 空手也会走完 deliver/place（实测 random5 任务 1 heweidao
+            # feedback=0.22 夹空却全链 success）。
+            grip_min = float(getattr(self.geometry, "grip_feedback_min", 0.0) or 0.0)
+            if self.execute_enabled and grip_min > 0.0 and feedback is not None and feedback < grip_min:
+                self._publish_status(
+                    "failed",
+                    f"夹空检测：feedback={feedback:.4f} < 下限 {grip_min:.3f}，商品未入指间",
+                )
+                self.get_logger().error(
+                    f"夹空检测失败：feedback={feedback:.4f} < grip_feedback_min={grip_min:.3f}；"
+                    "商品不在指间，拒绝继续（executor 将标记本目标失败）"
+                )
+                self.success = False
+                self.done = True
+                return
             self._publish_status(
                 "reached",
                 f"已保持闭爪命令 {elapsed:.2f}s；反馈仅作诊断值={feedback}",

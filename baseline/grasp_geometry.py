@@ -43,6 +43,9 @@ class GraspGeometry:
     grip_close: float = 0.08
     # JointState feedback threshold accepted by lift as "closed enough".
     grip_feedback_max: float = 0.85
+    # 夹空检测下限：闭爪后 feedback 低于该值 = 指头越过商品闭到指令位
+    # （没夹到东西）。0 = 不启用。比赛流程靠它识别"空手配送"。
+    grip_feedback_min: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         """输出可写入 ROS JSON 的稳定元数据。"""
@@ -55,6 +58,7 @@ class GraspGeometry:
             "calibrated": bool(self.calibrated),
             "grip_close": round(float(self.grip_close), 5),
             "grip_feedback_max": round(float(self.grip_feedback_max), 5),
+            "grip_feedback_min": round(float(self.grip_feedback_min), 5),
             "surface_to_center_fwd": round(float(self.surface_to_center_fwd), 5),
             "deploy_offset": [round(float(v), 5) for v in self.deploy_offset],
             "creep_stop_dy": round(float(self.creep_stop_dy), 5),
@@ -98,8 +102,11 @@ TENDON_PER_METER = 12.5
 MAX_GRIPPER_OPENING_M = 0.08
 # 通用门禁下限：夹持宽度小于 0.068 m 的类别不必单独放宽，沿用已验证的 0.85。
 GRIP_FEEDBACK_FLOOR = 0.85
-# 正确夹住时留 5% 余量，避免浮点/求解器量化把边界情况误判为未闭合。
-_GRIP_GATE_MARGIN = 1.05
+# 正确夹住时留 12% 余量：腱反馈的最终值有 ±3% 波动（MuJoCo 接触求解，
+# 实测同一参数多次闭爪 0.8265/0.856/0.881 横跨门禁），余量不足会把
+# 成功夹取误拒在 lift 门口。门禁只是"允许尝试 lift"的门槛，
+# 成功与否最终以裁判遥测（gripped 帧数 + 物体 z 上升）为准。
+_GRIP_GATE_MARGIN = 1.12
 
 
 def grip_gate_for_opening(opening_m: float) -> float:
@@ -141,6 +148,7 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         source="official_mjcf",
         # 两指跨过 x 维 0.0650（approach 沿 y，故 surface 修正为 0.1000/2）。
         grip_feedback_max=grip_gate_for_opening(0.0650),
+        grip_feedback_min=0.7,
         calibrated=True,
     ),
     "heweidao": GraspGeometry(
@@ -155,8 +163,13 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         source="official_mjcf",
         # Telemetry: 0.205 still held both fingers; 0.095 lost the left finger.
         # Use a less aggressive hold target and a category-specific lift gate.
+        # 轻夹策略（grip_close=0.22）下"夹住"与"没夹住"的反馈差异天然很小
+        # （实测波动带 0.94~0.99），门禁卡 0.95 会把成功夹取误拒在毫厘之间
+        # （demo 实测 0.9541 vs 0.950）。放宽到 0.99 允许尝试 lift ——
+        # 最终判定以裁判遥测为准，门禁不构成成功判据。
         grip_close=0.22,
-        grip_feedback_max=0.95,
+        grip_feedback_max=0.99,
+        grip_feedback_min=0.5,
     ),
     "shupian": GraspGeometry(
         surface_to_center_fwd=0.0325,
@@ -167,6 +180,7 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         mass_kg=0.1370,
         source="official_mjcf",
         grip_feedback_max=grip_gate_for_opening(0.0650),
+        grip_feedback_min=0.6,
     ),
     "zhijin": GraspGeometry(
         surface_to_center_fwd=0.0425,
@@ -197,8 +211,13 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         # 扫描 0.060/0.050/0.040：0.050 成功（抬升 41.6 mm，得分 768.5），
         # 0.060 太松滑落、0.040 过紧把商品压歪挤出（倾角 27°）——
         # 典型的预压最优曲线。重物必须带预压，这正是逐类参数的意义。
+        # 2026-09-11 补充：闭爪接触的最终反馈有 ±3% 随机波动（MuJoCo 接触
+        # 求解），两次实测 0.8265/0.8808 横跨原门禁 0.8531 —— 门禁卡在波动带内
+        # 会时好时坏。放宽到 0.90：仍能拒绝"完全没夹"（feedback→1.0 全开），
+        # 但吸收波动。标定扫描已证 0.050 预压下能稳定抬升 41.6mm。
         grip_close=0.050,
-        grip_feedback_max=grip_gate_for_opening(0.0650),
+        grip_feedback_max=0.90,
+        grip_feedback_min=0.7,
         calibrated=True,
     ),
     "kele": GraspGeometry(
@@ -211,6 +230,7 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         source="official_mjcf",
         # 0.0530 → 0.696，低于下限，仍用 0.85；实测已通过。
         grip_feedback_max=grip_gate_for_opening(0.0530),
+        grip_feedback_min=0.6,
     ),
     "kouxiangtang": GraspGeometry(
         surface_to_center_fwd=0.0245,
@@ -222,6 +242,7 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         source="official_mjcf",
         # 0.0490 → 0.643，低于下限，仍用 0.85。
         grip_feedback_max=grip_gate_for_opening(0.0490),
+        grip_feedback_min=0.6,
     ),
     "pingguo": GraspGeometry(
         surface_to_center_fwd=0.0350,
@@ -236,6 +257,7 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         # 实测反馈 0.872 与该换算吻合（误差 3 mm），说明球体本身已夹正，
         # 是门禁阈值按 0.85 硬编码造成的误判，不是抓取几何错误。
         grip_feedback_max=grip_gate_for_opening(0.0700),
+        grip_feedback_min=0.75,
     ),
     "chengzi": GraspGeometry(
         surface_to_center_fwd=0.0370,
@@ -248,6 +270,7 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         # 与 pingguo 同类的门禁误判：0.0740 → 0.925，高于 0.85。
         # 提前一并修正，避免标定完苹果后再在橙子上重复同一个问题。
         grip_feedback_max=grip_gate_for_opening(0.0740),
+        grip_feedback_min=0.85,
     ),
 }
 
