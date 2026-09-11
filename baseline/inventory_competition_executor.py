@@ -99,6 +99,9 @@ DELIVERY_BASE_Y = (-3.880, -2.620)
 SLOT_SNAP_RADIUS = _env_float("SUPERMARKET_SLOT_SNAP_RADIUS", 0.13)
 # creep 失败后的重对准重试次数（回退 10cm 后重新 deploy→creep）
 CREEP_RETRY_MAX = int(_env_float("SUPERMARKET_CREEP_RETRY_MAX", 2))
+# 单个目标失败后先收臂到安全位再继续下一目标；连续失败到上限才终结整轮。
+# 此前"一个目标失败即停止本轮"让 5 个任务的比赛只跑了 1 个就结束。
+MAX_CONSECUTIVE_FAILURES = int(_env_float("SUPERMARKET_MAX_CONSECUTIVE_FAILURES", 3))
 NAV_GOAL_TOPIC_EXEC = NAV_GOAL_TOPIC
 DEFAULT_MAPPING_SPEED = 0.35   # 货架前巡游扫描安全低速
 DEFAULT_CRUISE_SPEED = 1.2     # 长直 clear 段（去配送/返程）巡航速度
@@ -192,6 +195,9 @@ class InventoryCompetitionExecutor(Node):
         self.started_at = time.monotonic()
         self.map = InventoryMap()
         self.tracks: dict[str, list[Track]] = defaultdict(list)
+        self.creep_retry = 0
+        self.consecutive_failures = 0
+        self.recovering_from_failure = False
         self.targets: list[Target] = []
         self.current_index = 0
         self.task_received = False
@@ -247,6 +253,15 @@ class InventoryCompetitionExecutor(Node):
         self.post_place_safe_pose_active = False
         self.exec_success = False
         self.baseline_dir = Path(__file__).resolve().parent
+        # 45 货位真值表：把检测坐标吸附到最近同类货位，消除 8cm 级检测抖动。
+        # 必须在 baseline_dir 之后初始化（顺序敏感）。
+        self.slot_truth = _load_slot_truth(
+            self.baseline_dir / "official_baseline" / "examples" / "supermarket_sorting" / "retail_competition_layout.json"
+        )
+        if self.slot_truth:
+            self.get_logger().info(
+                f"[exec] 货位真值表已加载：{len(self.slot_truth)} 槽位，吸附半径 {SLOT_SNAP_RADIUS}m"
+            )
         # 分段底盘驾驶：每段 (x,y,yaw,pickup,速度)；pickup 段忽略货架本体雷达
         self.drive_goals: list[tuple[float, float, float, bool, float, bool]] = []
         self.observe_row = False   # 已在货架前观察行（相邻货架可 pickup 横向移动）
@@ -1562,8 +1577,9 @@ class InventoryCompetitionExecutor(Node):
             self._save_map()
         self._reset_navigation_state(reason=f"当前目标失败：{reason}")
         self._publish_targets("target_failed")
-        # 真实机械动作失败时可能仍然夹持商品或处于不安全姿态；
-        # 不再自动换下一个目标，立即停止本轮，避免底盘继续运动。
+        # 真实机械动作失败时可能仍然夹持商品或处于不安全姿态，不能直接继续
+        # 驱动底盘——但也不能因此终结整轮（5 个目标只跑 1 个）。折中：先收臂
+        # 到 safe_pose 确认安全，再推进下一目标；连续失败到上限才停止。
         if (
             reason.startswith("动作阶段")
             or reason.startswith("place worker")
@@ -1573,8 +1589,18 @@ class InventoryCompetitionExecutor(Node):
             or reason.startswith("plan-only IK")
             or reason.startswith("预抓取")
         ):
-            self.get_logger().error("[exec] 动作或导航失败，停止本轮，不继续驱动底盘")
-            self._finish_exec(False)
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                self.get_logger().error(
+                    f"[exec] 连续失败 {self.consecutive_failures} 次，达到上限，停止本轮"
+                )
+                self._finish_exec(False)
+                return
+            self.get_logger().warning(
+                f"[exec] 目标失败（连续 {self.consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}）："
+                "先收臂到安全位，再继续下一目标"
+            )
+            self._recover_to_next()
             return
         self.current_index += 1
         if self.current_index < len(self.targets):
@@ -1683,6 +1709,15 @@ class InventoryCompetitionExecutor(Node):
         self.arm_index += 1
         self._start_arm_action()
 
+    def _recover_to_next(self) -> None:
+        """动作失败后的安全恢复：收臂到 safe_pose，再推进下一目标。"""
+        self.recovering_from_failure = True
+        self.phase = "post_place_safe_pose"
+        self.post_place_safe_pose_active = True
+        self.arm_worker = None
+        self._spawn_arm(POST_PLACE_SAFE_POSE)
+        self._publish_flow("failed_recover_to_next")
+
     def _post_place_safe_pose_tick(self) -> None:
         if self.arm_worker is None:
             self._fail_current("post_place_safe_pose worker 丢失")
@@ -1699,9 +1734,19 @@ class InventoryCompetitionExecutor(Node):
         if target is None:
             self._finish_exec(True)
             return
-        if target.candidate is not None:
-            self.map.mark(target.candidate.slot, "placed", target.target_id)
-        target.status = "placed"
+        if self.recovering_from_failure:
+            # 该目标是失败跳过的，不能标记为已放置（会污染库存地图）
+            target.status = "failed"
+            self.recovering_from_failure = False
+            self._publish_flow("failed_target_skipped")
+            self.get_logger().warning(
+                f"[exec] 目标 {target.target_id} 失败跳过，继续下一目标"
+            )
+        else:
+            if target.candidate is not None:
+                self.map.mark(target.candidate.slot, "placed", target.target_id)
+            target.status = "placed"
+            self.consecutive_failures = 0
         self.current_index += 1
         self._save_map()
         self._publish_inventory()
