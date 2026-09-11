@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import time
 import traceback
 from abc import abstractmethod
@@ -90,7 +91,22 @@ class SimulatorBase:
         self.decimation = self.config.decimation
         self.delta_t = self.mj_model.opt.timestep * self.decimation
         self.render_fps = self.config.render_set["fps"]
+        # 3DGS is expensive on the X11 path. Keep ROS camera data/physics
+        # responsive by limiting render() calls independently of physics.
+        render_limit = os.getenv("SUPERMARKET_RENDER_FPS")
+        try:
+            self.render_fps = max(1.0, float(render_limit)) if render_limit else float(self.render_fps)
+        except ValueError:
+            print(f"Invalid SUPERMARKET_RENDER_FPS={render_limit!r}; using configured fps", flush=True)
+        self._next_render_sim_time = 0.0
         self.img_rgb_native_aruco_s = {}
+        self.batch_render_results = {}
+        self._gs_async_enabled = (
+            os.getenv("SUPERMARKET_GS_ASYNC", "1").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._gs_render_lock = threading.Lock()
+        self._gs_render_thread = None
 
         if self.config.enable_render:
             self.free_camera = mujoco.MjvCamera()
@@ -295,7 +311,24 @@ class SimulatorBase:
                             flush=True,
                         )
 
-            self.renderer = mujoco.Renderer(self.mj_model, self.config.render_set["height"], self.config.render_set["width"])
+            # The X server's visible screen may be smaller than the requested
+            # internal render size. MuJoCo still needs an offscreen framebuffer
+            # at least as large as the image passed to Renderer.
+            requested_width = int(self.config.render_set["width"])
+            requested_height = int(self.config.render_set["height"])
+            self.mj_model.vis.global_.offwidth = max(
+                self.mj_model.vis.global_.offwidth, requested_width
+            )
+            self.mj_model.vis.global_.offheight = max(
+                self.mj_model.vis.global_.offheight, requested_height
+            )
+            print(
+                f"GUI framebuffer: {self.mj_model.vis.global_.offwidth}x"
+                f"{self.mj_model.vis.global_.offheight}; render={requested_width}x{requested_height}",
+                flush=True,
+            )
+
+            self.renderer = mujoco.Renderer(self.mj_model, requested_height, requested_width)
 
         for i in range(self.mj_model.nbody):
             if len(self.mj_model.body(i).name) and self.mj_model.body(i).dofnum == 6:
@@ -327,11 +360,60 @@ class SimulatorBase:
 
         return width, height
 
+    @staticmethod
+    def _get_camera_frame(collection, camera_id):
+        """Safely read a camera frame from dict/list/tuple containers.
+
+        The async 3DGS path may not have produced the first camera-0 frame yet;
+        a missing cache entry must not terminate the physics loop.
+        """
+        if collection is None:
+            return None
+        if isinstance(collection, dict):
+            frame = collection.get(camera_id)
+            if frame is None:
+                frame = collection.get(str(camera_id))
+            return frame
+        try:
+            return collection[camera_id]
+        except (IndexError, KeyError, TypeError):
+            return None
+
     def _convert_gs_render_results(self, results_tensor):
+        """Normalize GS renderer results to ``{camera_id: (rgb, depth)}``.
+
+        Installed gsplat versions have returned either a camera-keyed dict or
+        a batched ``(rgb, depth)`` pair. Treat an empty/unsupported result as
+        an empty frame set so the caller can use its safe fallback image.
+        """
+        if results_tensor is None:
+            return {}
+        if isinstance(results_tensor, dict):
+            items = results_tensor.items()
+        elif isinstance(results_tensor, (tuple, list)) and len(results_tensor) == 2:
+            rgb_batch, depth_batch = results_tensor
+            try:
+                items = ((index, (rgb_batch[index], depth_batch[index])) for index in range(len(rgb_batch)))
+            except (TypeError, AttributeError):
+                return {}
+        else:
+            # ``render([])`` in some package versions returns three empty
+            # dictionaries; no camera frame is available in that case.
+            return {}
+
         results = {}
-        for cid, (rgb_tensor, depth_tensor) in results_tensor.items():
-            rgb = (255. * torch.clamp(rgb_tensor, 0.0, 1.0)).to(torch.uint8).cpu().numpy()
-            depth = depth_tensor.cpu().numpy()
+        for raw_cid, value in items:
+            try:
+                cid = int(raw_cid)
+                rgb_tensor, depth_tensor = value[:2]
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            if torch.is_tensor(rgb_tensor):
+                rgb = (255. * torch.clamp(rgb_tensor, 0.0, 1.0)).to(torch.uint8).cpu().numpy()
+            else:
+                rgb = np.clip(np.asarray(rgb_tensor), 0.0, 1.0)
+                rgb = np.asarray(255. * rgb, dtype=np.uint8)
+            depth = depth_tensor.cpu().numpy() if torch.is_tensor(depth_tensor) else np.asarray(depth_tensor)
             results[cid] = (rgb, depth)
         return results
 
@@ -389,6 +471,58 @@ class SimulatorBase:
             
         return True
 
+    def _schedule_async_gs_render(self, render_width: int, render_height: int) -> None:
+        """Snapshot MuJoCo state and render 3DGS without blocking physics."""
+        obs_cam_ids = sorted(set(self.config.obs_rgb_cam_id + self.config.obs_depth_cam_id))
+        if not obs_cam_ids or not hasattr(self, "gs_renderer"):
+            return
+        with self._gs_render_lock:
+            if self._gs_render_thread is not None and self._gs_render_thread.is_alive():
+                return
+            body_ids = np.asarray(self.gs_renderer.gs_body_ids, dtype=np.int32)
+            body_pos = self.mj_data.xpos[body_ids].copy()
+            body_quat = self.mj_data.xquat[body_ids].copy()
+            cam_ids = np.asarray(obs_cam_ids, dtype=np.int32)
+            cam_pos = self.mj_data.cam_xpos[cam_ids].copy()
+            cam_xmat = self.mj_data.cam_xmat[cam_ids].copy()
+            fovy = self.mj_model.cam_fovy[cam_ids].copy()
+            self._gs_render_thread = threading.Thread(
+                target=self._async_gs_render_worker,
+                args=(body_pos, body_quat, cam_pos, cam_xmat, fovy, render_width, render_height, obs_cam_ids),
+                name="gs-render",
+                daemon=True,
+            )
+            self._gs_render_thread.start()
+
+    def _async_gs_render_worker(
+        self,
+        body_pos: np.ndarray,
+        body_quat: np.ndarray,
+        cam_pos: np.ndarray,
+        cam_xmat: np.ndarray,
+        fovy: np.ndarray,
+        render_width: int,
+        render_height: int,
+        cam_ids: list[int],
+    ) -> None:
+        try:
+            self.gs_renderer.update_gaussian_properties(body_pos, body_quat)
+            rgb_tensor, depth_tensor = self.gs_renderer.render_batch(
+                cam_pos, cam_xmat, render_height, render_width, fovy
+            )
+            tensor_results = {
+                cid: (rgb_tensor[index], depth_tensor[index])
+                for index, cid in enumerate(cam_ids)
+            }
+            results = self._convert_gs_render_results(tensor_results)
+            with self._gs_render_lock:
+                self.batch_render_results = results
+                for cid, (rgb, depth) in results.items():
+                    self.img_rgb_obs_s[cid] = rgb
+                    self.img_depth_obs_s[cid] = depth
+        except Exception as exc:
+            print(f"[simulator] async 3DGS render failed: {type(exc).__name__}: {exc}", flush=True)
+
     def render(self):
         self.render_cnt += 1
 
@@ -398,82 +532,92 @@ class SimulatorBase:
         display_result = None
 
         self.update_renderer_window_size(render_width, render_height)
+        display_cam_id = self.cam_id if not self.config.headless and self.window is not None else None
         if self.config.use_gaussian_renderer and self.show_gaussian_img:
+            if self._gs_async_enabled:
+                self._schedule_async_gs_render(render_width, render_height)
+                with self._gs_render_lock:
+                    latest_results = dict(self.batch_render_results)
+                if display_cam_id is not None:
+                    display_result = latest_results.get(display_cam_id)
+            else:
+                obs_cam_ids = list(set(self.config.obs_rgb_cam_id + self.config.obs_depth_cam_id))
+                render_cam_ids = obs_cam_ids.copy()
+                if display_cam_id is not None and (window_width, window_height) == (render_width, render_height):
+                    if display_cam_id not in render_cam_ids:
+                        render_cam_ids.append(display_cam_id)
 
-            obs_cam_ids = list(set(self.config.obs_rgb_cam_id + self.config.obs_depth_cam_id))
-            display_cam_id = self.cam_id if not self.config.headless and self.window is not None else None
-            render_cam_ids = obs_cam_ids.copy()
-            if display_cam_id is not None and (window_width, window_height) == (render_width, render_height):
-                if display_cam_id not in render_cam_ids:
-                    render_cam_ids.append(display_cam_id)
-            
-            if len(render_cam_ids) > 0 or display_cam_id is not None:
-                if -1 in render_cam_ids or display_cam_id == -1:
-                    self.renderer.update_scene(self.mj_data, self.free_camera, self.options)
+                if len(render_cam_ids) > 0 or display_cam_id is not None:
+                    if -1 in render_cam_ids or display_cam_id == -1:
+                        self.renderer.update_scene(self.mj_data, self.free_camera, self.options)
 
-                self.gs_renderer.update_gaussians(self.mj_data)
-                self.batch_render_results = {}
+                    self.gs_renderer.update_gaussians(self.mj_data)
+                    self.batch_render_results = {}
 
-                if len(render_cam_ids) > 0:
-                    if getattr(self.config, "gs_render_sequential", False):
-                        for render_cam_id in render_cam_ids:
+                    if len(render_cam_ids) > 0:
+                        if getattr(self.config, "gs_render_sequential", False):
+                            for render_cam_id in render_cam_ids:
+                                results_tensor = self.gs_renderer.render(
+                                    self.mj_model,
+                                    self.mj_data,
+                                    [render_cam_id],
+                                    render_width,
+                                    render_height,
+                                    self.free_camera,
+                                )
+                                self.batch_render_results.update(
+                                    self._convert_gs_render_results(results_tensor)
+                                )
+                        else:
                             results_tensor = self.gs_renderer.render(
                                 self.mj_model,
                                 self.mj_data,
-                                [render_cam_id],
+                                render_cam_ids,
                                 render_width,
                                 render_height,
-                                self.free_camera
+                                self.free_camera,
                             )
-                            self.batch_render_results.update(
-                                self._convert_gs_render_results(results_tensor)
+                            self.batch_render_results = self._convert_gs_render_results(results_tensor)
+
+                    if display_cam_id is not None:
+                        if (window_width, window_height) == (render_width, render_height) and display_cam_id in self.batch_render_results:
+                            display_result = self.batch_render_results[display_cam_id]
+                        else:
+                            window_results_tensor = self.gs_renderer.render(
+                                self.mj_model,
+                                self.mj_data,
+                                [display_cam_id],
+                                window_width,
+                                window_height,
+                                self.free_camera,
                             )
-                    else:
-                        results_tensor = self.gs_renderer.render(
-                            self.mj_model,
-                            self.mj_data,
-                            render_cam_ids,
-                            render_width,
-                            render_height,
-                            self.free_camera
-                        )
-                        self.batch_render_results = self._convert_gs_render_results(results_tensor)
+                            display_result = self._convert_gs_render_results(window_results_tensor).get(display_cam_id)
 
-                if display_cam_id is not None:
-                    if (window_width, window_height) == (render_width, render_height) and display_cam_id in self.batch_render_results:
-                        display_result = self.batch_render_results[display_cam_id]
-                    else:
-                        window_results_tensor = self.gs_renderer.render(
-                            self.mj_model,
-                            self.mj_data,
-                            [display_cam_id],
-                            window_width,
-                            window_height,
-                            self.free_camera
-                        )
-                        display_result = self._convert_gs_render_results(window_results_tensor).get(display_cam_id)
+                    for cid, (rgb, depth) in self.batch_render_results.items():
+                        self.img_rgb_obs_s[cid] = rgb
+                        self.img_depth_obs_s[cid] = depth
 
-                for cid, (rgb, depth) in self.batch_render_results.items():
-                    self.img_rgb_obs_s[cid] = rgb
-                    self.img_depth_obs_s[cid] = depth
+            # 3DGS RGB does not contain the MJCF ArUco tiles. If requested,
+            # render native ArUco frames on the physics/GL thread only.
+            if os.getenv("SUPERMARKET_PUBLISH_ARUCO_NATIVE", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                native_names = {
+                    item.strip().lower()
+                    for item in os.getenv("SUPERMARKET_ARUCO_NATIVE_CAMERAS", "head").split(",")
+                    if item.strip()
+                }
+                native_ids = [
+                    index
+                    for index, name in enumerate(("head", "left", "right"))
+                    if name in native_names and index in self.config.obs_rgb_cam_id
+                ]
+                depth_rendering = self.renderer._depth_rendering
+                self.renderer.disable_depth_rendering()
+                try:
+                    for native_id in native_ids:
+                        self.img_rgb_native_aruco_s[native_id] = self.getRgbImg(native_id)
+                finally:
+                    self.renderer._depth_rendering = depth_rendering
 
-                # 3DGS RGB 不包含 MJCF 中的 ArUco tile。原生 MuJoCo RGB 必须
-                # 在同一个仿真渲染线程中生成，不能从 ROS 发布线程调用 getRgbImg，
-                # 否则 EGL 上下文会触发 EGL_BAD_ACCESS。
-                if os.getenv("SUPERMARKET_PUBLISH_ARUCO_NATIVE", "0").strip().lower() in {"1", "true", "yes", "on"}:
-                    native_names = {item.strip().lower() for item in os.getenv("SUPERMARKET_ARUCO_NATIVE_CAMERAS", "head").split(",") if item.strip()}
-                    native_ids = [
-                        index for index, name in enumerate(("head", "left", "right"))
-                        if name in native_names and index in self.config.obs_rgb_cam_id
-                    ]
-                    depth_rendering = self.renderer._depth_rendering
-                    self.renderer.disable_depth_rendering()
-                    try:
-                        for native_id in native_ids:
-                            self.img_rgb_native_aruco_s[native_id] = self.getRgbImg(native_id)
-                    finally:
-                        self.renderer._depth_rendering = depth_rendering
-        
         else:
             depth_rendering = self.renderer._depth_rendering
             self.renderer.disable_depth_rendering()
@@ -494,17 +638,25 @@ class SimulatorBase:
             if not self.renderer._depth_rendering:
                 if self.config.use_gaussian_renderer and self.show_gaussian_img and display_result is not None:
                     img_vis = display_result[0]
-                elif self.cam_id in self.config.obs_rgb_cam_id and (window_width, window_height) == (render_width, render_height):
-                    img_vis = self.img_rgb_obs_s[self.cam_id]
                 else:
-                    img_vis = self.getRgbImg(self.cam_id)
+                    cached_rgb = self._get_camera_frame(self.img_rgb_obs_s, self.cam_id)
+                    if cached_rgb is not None and self.cam_id in self.config.obs_rgb_cam_id and (window_width, window_height) == (render_width, render_height):
+                        img_vis = cached_rgb
+                    else:
+                        # Async GS can miss the first frame; use the native
+                        # MuJoCo camera until a GS frame is available.
+                        img_vis = self.getRgbImg(self.cam_id)
             else:
                 if self.config.use_gaussian_renderer and self.show_gaussian_img and display_result is not None:
                     img_depth = display_result[1]
-                elif self.cam_id in self.config.obs_depth_cam_id and (window_width, window_height) == (render_width, render_height):
-                    img_depth = self.img_depth_obs_s[self.cam_id]
                 else:
-                    img_depth = self.getDepthImg(self.cam_id)
+                    cached_depth = self._get_camera_frame(self.img_depth_obs_s, self.cam_id)
+                    if cached_depth is not None and self.cam_id in self.config.obs_depth_cam_id and (window_width, window_height) == (render_width, render_height):
+                        img_depth = cached_depth
+                    else:
+                        # Async GS can miss the first depth frame; use the
+                        # native MuJoCo depth camera until a GS frame exists.
+                        img_depth = self.getDepthImg(self.cam_id)
                 
                 if img_depth is not None:
                     img_vis = cv2.applyColorMap(cv2.convertScaleAbs(img_depth, alpha=255./self.config.max_render_depth), cv2.COLORMAP_JET)
@@ -513,12 +665,20 @@ class SimulatorBase:
 
             try:
                 if glfw.window_should_close(self.window):
-                    # WSLg/XWayland 偶发把窗口表面报告为“已关闭”，但窗口实际仍可继续显示。
-                    # 观察容器默认不因该瞬时状态退出；需要真正关闭时可设置
-                    # SUPERMARKET_GUI_EXIT_ON_CLOSE=1 恢复原行为。
+                    # XLaunch/XWayland 偶发把窗口表面报告为“已关闭”，但窗口实际仍可继续显示。
+                    # 默认把它视为瞬态事件：记录、清除关闭标志并恢复窗口；只有显式
+                    # SUPERMARKET_GUI_EXIT_ON_CLOSE=1 才允许窗口关闭终止仿真。
+                    self.gui_close_events = getattr(self, "gui_close_events", 0) + 1
+                    print(
+                        f"[simulator] GUI close event #{self.gui_close_events}; "
+                        f"exit_on_close={os.getenv('SUPERMARKET_GUI_EXIT_ON_CLOSE', '0')}",
+                        flush=True,
+                    )
+                    # A transient X11/XWayland close flag is a display event,
+                    # not a simulation shutdown request.  The Server entry
+                    # point owns shutdown through stop_event/ROS Context.
                     if os.getenv("SUPERMARKET_GUI_EXIT_ON_CLOSE", "0") == "1":
-                        self.running = False
-                        return
+                        print("[simulator] GUI exit request ignored; use Server stop_event to shut down", flush=True)
                     glfw.set_window_should_close(self.window, False)
                     glfw.set_window_pos(self.window, 40, 40)
                     glfw.show_window(self.window)
@@ -747,6 +907,9 @@ class SimulatorBase:
     def _cleanup_before_exit(self):
         """在Python退出前执行的清理函数"""
         try:
+            gs_thread = getattr(self, "_gs_render_thread", None)
+            if gs_thread is not None and gs_thread.is_alive():
+                gs_thread.join(timeout=10.0)
             # 如果GLFW上下文有效，先清理Mujoco渲染器
             if hasattr(self, 'renderer'):
                 try:
@@ -823,8 +986,12 @@ class SimulatorBase:
             self.resetState()
         
         self.post_physics_step()
-        if self.config.enable_render and self.render_cnt-1 < self.mj_data.time * self.render_fps:
+        if (
+            self.config.enable_render
+            and self.mj_data.time >= self._next_render_sim_time
+        ):
             self.render()
+            self._next_render_sim_time = self.mj_data.time + (1.0 / self.render_fps)
 
         return self.getObservation(), self.getPrivilegedObservation(), self.getReward(), terminated, {}
 
@@ -832,7 +999,8 @@ class SimulatorBase:
         self.mj_data.time += self.delta_t
         self.mj_data.qvel[:] = 0
         mujoco.mj_forward(self.mj_model, self.mj_data)
-        if self.render_cnt-1 < self.mj_data.time * self.render_fps:
+        if self.mj_data.time >= self._next_render_sim_time:
             self.render()
+            self._next_render_sim_time = self.mj_data.time + (1.0 / self.render_fps)
 
 

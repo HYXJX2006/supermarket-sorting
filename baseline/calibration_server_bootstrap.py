@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""启动固定 Baseline Server，并由单一入口统一管理 ROS 生命周期。"""
+"""固定单目标标定 Server：与 server_bootstrap 相同的固定基线，但启用裁判桥。
+
+与 ``random_server_bootstrap.py`` 的区别：
+  - 不强制 SUPERMARKET_RANDOMIZE=1，允许 SUPERMARKET_FIXED_BASELINE=1；
+  - 同样启用 RefereeBridge，因此会发布
+    ``/referee/gameinfo``、``/referee/target_state``（含 grounded truth
+    的 ``gripped`` / ``finger_contacts`` / ``position_world``），
+    供只读记录器取证，避免用控制器退出码冒充抓取成功。
+"""
 from __future__ import annotations
 
 import importlib.util
@@ -10,31 +18,15 @@ import threading
 import traceback
 from pathlib import Path
 
-# Allow sibling development helpers mounted under /workspace/baseline to be imported.
 _BOOTSTRAP_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_BOOTSTRAP_DIR))
 
-SERVER = "/workspace/supermarket_sorting_task/examples/supermarket_sorting/supermarket_sorting_server.py"
 SERVER_DIR = "/workspace/supermarket_sorting_task/examples/supermarket_sorting"
+SERVER = SERVER_DIR + "/supermarket_sorting_server.py"
 
 
-def _disable_dev_sync() -> None:
-    """让本地开发测试跳过实时同步；正式运行默认不触发。"""
-    if os.getenv("SUPERMARKET_DEV_DISABLE_SYNC", "0") != "1":
-        return
-    from discoverse.robots_env.mmk2_base import MMK2Cfg
-    MMK2Cfg.sync = False
-    print("[bootstrap] development mode: cfg.sync=False", flush=True)
-
-
-def _load_server_module():
-    spec = importlib.util.spec_from_file_location("official_supermarket_server", SERVER)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load official Server: {SERVER}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def main() -> int:
@@ -43,15 +35,20 @@ def main() -> int:
     if SERVER_DIR not in sys.path:
         sys.path.insert(0, SERVER_DIR)
 
-    _disable_dev_sync()
     import rclpy
     from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
     from rclpy.signals import SignalHandlerOptions
 
+    spec = importlib.util.spec_from_file_location("official_calib_server", SERVER)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load Server: {SERVER}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
     if not rclpy.ok():
         rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
 
-    module = _load_server_module()
     from server_debug_spawn import patch_build_config
     patch_build_config(module)
 
@@ -71,10 +68,38 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
     exec_node._ros_stop_event = stop_event
     context = rclpy.get_default_context()
     executor = SingleThreadedExecutor(context=context)
     executor.add_node(exec_node)
+
+    referee = None
+    referee_bridge = None
+    if _truthy(os.getenv("SUPERMARKET_ENABLE_SCORE", "1")):
+        referee_dir = _BOOTSTRAP_DIR / "official_baseline" / "examples" / "supermarket_sorting"
+        sys.path.insert(0, str(referee_dir))
+        from referee import Referee
+        from referee_bridge import RefereeBridge
+
+        referee_config = os.getenv(
+            "SUPERMARKET_REFEREE_CONFIG",
+            str(referee_dir / "referee_json" / "retail_referee_config.json"),
+        )
+        target_bodies = [str(item["id"]) for item in getattr(config, "task_targets", [])]
+        object_bodies = [str(name) for name in getattr(config, "obj_list", [])]
+        referee = Referee(exec_node.mj_model, target_bodies, object_bodies, referee_config)
+        referee.reset(exec_node.mj_data)
+        referee_bridge = RefereeBridge(referee, config, threading.Event())
+        executor.add_node(referee_bridge)
+        referee_bridge.publish_state(float(exec_node.mj_data.time), exec_node.mj_data)
+        print(
+            f"[server] referee enabled: targets={len(target_bodies)} "
+            "topics=/referee/gameinfo,/referee/target_state,/referee/score",
+            flush=True,
+        )
+    else:
+        print("[server] referee disabled (SUPERMARKET_ENABLE_SCORE=0)", flush=True)
 
     def spin_node() -> None:
         try:
@@ -95,17 +120,23 @@ def main() -> int:
     )
     spin_thread.start()
     pubtopic_thread.start()
-    if getattr(exec_node.config, "lidar_s2_sim", False):
-        print("[server] lidar enabled: /slamware_ros_sdk_server_node/scan (12 Hz)", flush=True)
 
     return_code = 0
     loop_count = 0
     try:
+        last_referee_publish = -1.0
         while rclpy.ok(context=context) and not stop_event.is_set():
             if not exec_node.running:
-                print("[server] simulator running flag was cleared; keeping ROS Server alive", flush=True)
                 exec_node.running = True
             exec_node.step(exec_node.target_control)
+            if referee is not None:
+                referee.update(exec_node.mj_data)
+                sim_time = float(exec_node.mj_data.time)
+                if referee_bridge is not None and (
+                    last_referee_publish < 0.0 or sim_time - last_referee_publish >= 0.1
+                ):
+                    referee_bridge.publish_state(sim_time, exec_node.mj_data)
+                    last_referee_publish = sim_time
             loop_count += 1
     except KeyboardInterrupt:
         pass
@@ -121,27 +152,29 @@ def main() -> int:
         if spin_thread.is_alive():
             executor.shutdown()
             spin_thread.join(timeout=2.0)
+        if referee_bridge is not None:
+            try:
+                executor.remove_node(referee_bridge)
+                referee_bridge.destroy_node()
+            except Exception as exc:
+                print(f"[server] referee cleanup warning: {exc}", flush=True)
         try:
             executor.remove_node(exec_node)
-        except Exception as exc:
-            print(f"[server] executor remove warning: {type(exc).__name__}: {exc}", flush=True)
+        except Exception:
+            pass
         try:
             exec_node.destroy_node()
-        except Exception as exc:
-            print(f"[server] destroy node warning: {type(exc).__name__}: {exc}", flush=True)
+        except Exception:
+            pass
         try:
             executor.shutdown()
-        except Exception as exc:
-            print(f"[server] executor shutdown warning: {type(exc).__name__}: {exc}", flush=True)
+        except Exception:
+            pass
         if rclpy.ok(context=context):
             rclpy.shutdown(context=context)
         signal.signal(signal.SIGINT, previous_signal_handlers[signal.SIGINT])
         signal.signal(signal.SIGTERM, previous_signal_handlers[signal.SIGTERM])
-        print(
-            f"[server] lifecycle closed: loops={loop_count} "
-            f"pub_alive={pubtopic_thread.is_alive()} spin_alive={spin_thread.is_alive()}",
-            flush=True,
-        )
+        print(f"[server] lifecycle closed: loops={loop_count}", flush=True)
     return return_code
 
 

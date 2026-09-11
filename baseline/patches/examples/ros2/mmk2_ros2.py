@@ -29,7 +29,11 @@ class MMK2ROS2(MMK2Base, Node):
             return False
 
     def _stop_on_ros_error(self, where, exc=None):
-        self.running = False
+        # ROS shutdown is owned by the Server entry point.  Do not change
+        # the simulator's `running` flag from a publisher/spin worker.
+        stop_event = getattr(self, "_ros_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
         detail = f": {exc}" if exc is not None else ""
         print(f"[server] ROS lifecycle stop at {where}{detail}", flush=True)
     def __init__(self, config: MMK2Cfg):
@@ -43,8 +47,15 @@ class MMK2ROS2(MMK2Base, Node):
         self.tctr_right_arm = self.target_control[12:18]
         self.tctr_rgt_gripper = self.target_control[18:19]
 
-        super().__init__(config)
+        # Initialize the ROS node before the long MuJoCo/renderer setup.
+        # This avoids a startup race where the default rclpy context can be
+        # observed as invalid after rendering initialization completes.
         Node.__init__(self, 'MMK2_mujoco_node')
+        # The Server entry point owns this event and sets it before joining
+        # worker threads.  The fallback keeps this class safe for the
+        # original standalone __main__ entry as well.
+        self._ros_stop_event = threading.Event()
+        super().__init__(config)
 
         self.pid_base_vel = PIDarray(
             kps=np.array([ 7.5 ,  7.5 ]),
@@ -280,18 +291,21 @@ class MMK2ROS2(MMK2Base, Node):
         except (RCLError, ExternalShutdownException) as exc:
             self._stop_on_ros_error("lidar publish", exc)
 
-    def thread_pubros2topic(self, freq=30):
+    def thread_pubros2topic(self, freq=30, stop_event=None):
+        """发布仿真 ROS 话题；生命周期由 Server 入口统一管理。"""
+        period = 1.0 / max(1.0, float(freq))
+        stop_event = stop_event or self._ros_stop_event
         try:
-            rate = self.create_rate(freq)
-            while rclpy.ok() and self.running:
+            while self.running and not stop_event.is_set() and self._ros_context_valid():
+                loop_started = time.monotonic()
                 time_stamp = self.get_clock().now().to_msg()
-    
+
                 self.joint_state.header.stamp = time_stamp
                 self.joint_state.position = self.sensor_qpos[2:].tolist()
                 self.joint_state.velocity = self.sensor_qvel[2:].tolist()
                 self.joint_state.effort = self.sensor_force[2:].tolist()
                 self.joint_state_puber.publish(self.joint_state)
-    
+
                 self.odom_msg.header.stamp = time_stamp
                 self.odom_msg.pose.pose.position.x = self.sensor_base_position[0]
                 self.odom_msg.pose.pose.position.y = self.sensor_base_position[1]
@@ -307,7 +321,7 @@ class MMK2ROS2(MMK2Base, Node):
                 self.odom_msg.twist.twist.angular.y = self.sensor_base_gyro[1]
                 self.odom_msg.twist.twist.angular.z = self.sensor_base_gyro[2]
                 self.odom_puber.publish(self.odom_msg)
-                
+
                 trans_msg = TransformStamped()
                 trans_msg.header.stamp = time_stamp
                 trans_msg.header.frame_id = "odom"
@@ -318,73 +332,86 @@ class MMK2ROS2(MMK2Base, Node):
                 trans_msg.transform.rotation.w = self.sensor_base_orientation[0]
                 trans_msg.transform.rotation.x = self.sensor_base_orientation[1]
                 trans_msg.transform.rotation.y = self.sensor_base_orientation[2]
-                trans_msg.transform.rotation.z = self.sensor_base_orientation[3]            
+                trans_msg.transform.rotation.z = self.sensor_base_orientation[3]
                 self.tf_broadcaster.sendTransform(trans_msg)
-    
-                # self.imu_msg.header.stamp = time_stamp
-                # self.imu_msg.orientation.w = self.sensor_base_orientation[0]
-                # self.imu_msg.orientation.x = self.sensor_base_orientation[1]
-                # self.imu_msg.orientation.y = self.sensor_base_orientation[2]
-                # self.imu_msg.orientation.z = self.sensor_base_orientation[3]
-                # self.imu_msg.angular_velocity.x = self.sensor_base_gyro[0]
-                # self.imu_msg.angular_velocity.y = self.sensor_base_gyro[1]
-                # self.imu_msg.angular_velocity.z = self.sensor_base_gyro[2]
-                # self.imu_msg.linear_acceleration.x = self.sensor_base_acc[0]
-                # self.imu_msg.linear_acceleration.y = self.sensor_base_acc[1]
-                # self.imu_msg.linear_acceleration.z = self.sensor_base_acc[2]
-                # # self.imu_puber.publish(self.imu_msg)
-    
+
+                # Headless/disabled-render smoke tests may not populate obs
+                # image/depth dictionaries.  Keep state, odom and lidar alive;
+                # publish camera topics only when a frame is actually present.
+                observations = getattr(self, "obs", {}) or {}
+                images = observations.get("img", {}) or {}
+                depths = observations.get("depth", {}) or {}
+
+                def observation_frame(collection, camera_id):
+                    if isinstance(collection, dict):
+                        return collection.get(camera_id)
+                    try:
+                        return collection[camera_id]
+                    except (IndexError, KeyError, TypeError):
+                        return None
+
                 if 0 in self.config.obs_rgb_cam_id:
-                    head_color_img_msg = self.bridge.cv2_to_imgmsg(self.obs["img"][0], encoding="rgb8")
-                    head_color_img_msg.header.stamp = time_stamp
-                    head_color_img_msg.header.frame_id = "head_camera"
-                    self.head_color_puber.publish(head_color_img_msg)
-                    if self.publish_native_aruco and "head" in self.native_aruco_cameras:
-                        native = getattr(self, "img_rgb_native_aruco_s", {}).get(0)
-                        if native is not None:
-                            native_msg = self.bridge.cv2_to_imgmsg(native, encoding="rgb8")
-                            native_msg.header.stamp = time_stamp
-                            native_msg.header.frame_id = "head_camera"
-                            self.head_aruco_puber.publish(native_msg)
-    
+                    head_image = observation_frame(images, 0)
+                    if head_image is not None:
+                        head_color_img_msg = self.bridge.cv2_to_imgmsg(head_image, encoding="rgb8")
+                        head_color_img_msg.header.stamp = time_stamp
+                        head_color_img_msg.header.frame_id = "head_camera"
+                        self.head_color_puber.publish(head_color_img_msg)
+                        if self.publish_native_aruco and "head" in self.native_aruco_cameras:
+                            native = getattr(self, "img_rgb_native_aruco_s", {}).get(0)
+                            if native is not None:
+                                native_msg = self.bridge.cv2_to_imgmsg(native, encoding="rgb8")
+                                native_msg.header.stamp = time_stamp
+                                native_msg.header.frame_id = "head_camera"
+                                self.head_aruco_puber.publish(native_msg)
+
                 if 1 in self.config.obs_rgb_cam_id:
-                    left_color_img_msg = self.bridge.cv2_to_imgmsg(self.obs["img"][1], encoding="rgb8")
-                    left_color_img_msg.header.stamp = time_stamp
-                    left_color_img_msg.header.frame_id = "left_camera"
-                    self.left_color_puber.publish(left_color_img_msg)
-                    if self.publish_native_aruco and "left" in self.native_aruco_cameras:
-                        native = getattr(self, "img_rgb_native_aruco_s", {}).get(1)
-                        if native is not None:
-                            native_msg = self.bridge.cv2_to_imgmsg(native, encoding="rgb8")
-                            native_msg.header.stamp = time_stamp
-                            native_msg.header.frame_id = "left_camera"
-                            self.left_aruco_puber.publish(native_msg)
-    
+                    left_image = observation_frame(images, 1)
+                    if left_image is not None:
+                        left_color_img_msg = self.bridge.cv2_to_imgmsg(left_image, encoding="rgb8")
+                        left_color_img_msg.header.stamp = time_stamp
+                        left_color_img_msg.header.frame_id = "left_camera"
+                        self.left_color_puber.publish(left_color_img_msg)
+                        if self.publish_native_aruco and "left" in self.native_aruco_cameras:
+                            native = getattr(self, "img_rgb_native_aruco_s", {}).get(1)
+                            if native is not None:
+                                native_msg = self.bridge.cv2_to_imgmsg(native, encoding="rgb8")
+                                native_msg.header.stamp = time_stamp
+                                native_msg.header.frame_id = "left_camera"
+                                self.left_aruco_puber.publish(native_msg)
+
                 if 2 in self.config.obs_rgb_cam_id:
-                    right_color_img_msg = self.bridge.cv2_to_imgmsg(self.obs["img"][2], encoding="rgb8")
-                    right_color_img_msg.header.stamp = time_stamp
-                    right_color_img_msg.header.frame_id = "right_camera"
-                    self.right_color_puber.publish(right_color_img_msg)
-                    if self.publish_native_aruco and "right" in self.native_aruco_cameras:
-                        native = getattr(self, "img_rgb_native_aruco_s", {}).get(2)
-                        if native is not None:
-                            native_msg = self.bridge.cv2_to_imgmsg(native, encoding="rgb8")
-                            native_msg.header.stamp = time_stamp
-                            native_msg.header.frame_id = "right_camera"
-                            self.right_aruco_puber.publish(native_msg)
-    
+                    right_image = observation_frame(images, 2)
+                    if right_image is not None:
+                        right_color_img_msg = self.bridge.cv2_to_imgmsg(right_image, encoding="rgb8")
+                        right_color_img_msg.header.stamp = time_stamp
+                        right_color_img_msg.header.frame_id = "right_camera"
+                        self.right_color_puber.publish(right_color_img_msg)
+                        if self.publish_native_aruco and "right" in self.native_aruco_cameras:
+                            native = getattr(self, "img_rgb_native_aruco_s", {}).get(2)
+                            if native is not None:
+                                native_msg = self.bridge.cv2_to_imgmsg(native, encoding="rgb8")
+                                native_msg.header.stamp = time_stamp
+                                native_msg.header.frame_id = "right_camera"
+                                self.right_aruco_puber.publish(native_msg)
+
                 if 0 in self.config.obs_depth_cam_id:
-                    head_depth_img = np.array(np.clip(self.obs["depth"][0]*1e3, 0, 65535), dtype=np.uint16)
-                    head_depth_img_msg = self.bridge.cv2_to_imgmsg(head_depth_img, encoding="mono16")
-                    head_depth_img_msg.header.stamp = time_stamp
-                    head_depth_img_msg.header.frame_id = "head_camera"
-                    self.head_depth_puber.publish(head_depth_img_msg)
-    
-                rate.sleep()
+                    head_depth = observation_frame(depths, 0)
+                    if head_depth is not None:
+                        head_depth_img = np.array(np.clip(head_depth * 1e3, 0, 65535), dtype=np.uint16)
+                        head_depth_img_msg = self.bridge.cv2_to_imgmsg(head_depth_img, encoding="mono16")
+                        head_depth_img_msg.header.stamp = time_stamp
+                        head_depth_img_msg.header.frame_id = "head_camera"
+                        self.head_depth_puber.publish(head_depth_img_msg)
+
+                remaining = period - (time.monotonic() - loop_started)
+                if remaining > 0:
+                    time.sleep(remaining)
         except (RCLError, ExternalShutdownException) as exc:
-            self._stop_on_ros_error("ROS topic worker", exc)
-        except Exception as exc:
-            self._stop_on_ros_error(f"ROS topic worker {type(exc).__name__}", exc)
+            # Expected only while the single Server owner is shutting ROS down.
+            print(f"[server] ROS topic worker stopped: {type(exc).__name__}: {exc}", flush=True)
+            stop_event.set()
+
 
 
 

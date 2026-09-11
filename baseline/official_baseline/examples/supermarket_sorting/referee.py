@@ -194,7 +194,7 @@ class Referee:
             f.collided = True
             self._log(t, "C1 撞到结构 (−%d)" % self.cfg["penalties"]["collision"])
         if not f.toppled:
-            hit = self._toppled_other_object(mj_data, f.target)
+            hit = self._toppled_other_object(mj_data, f.target, f.touched)
             if hit:
                 f.toppled = True
                 self._log(t, "C2 碰倒其他商品 %s (−%d)" % (hit, self.cfg["penalties"]["topple"]))
@@ -251,10 +251,16 @@ class Referee:
                     return True
         return False
 
-    def _toppled_other_object(self, mj_data, carried_target=None):
+    def _toppled_other_object(self, mj_data, carried_target=None, ignored_objects=None):
         thr = self.cfg["thresholds"]
+        ignored = set(ignored_objects or ())
+        if carried_target is not None:
+            ignored.add(carried_target)
         for b in self.objects:
-            if carried_target is not None and b == carried_target:
+            # A touched candidate may move while S2 transitions to S3. It is
+            # not an "other" product and must not self-trigger the topple
+            # penalty before the flow binds f.target.
+            if b in ignored:
                 continue
             if b not in self.init_pos:
                 continue

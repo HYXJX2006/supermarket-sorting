@@ -37,14 +37,17 @@ DETOUR_FRONT_STOP = 0.32
 SIDE_CLEARANCE = 0.38
 MIN_SIDE_CLEARANCE = 0.30
 WAYPOINT_TOLERANCE = 0.12
+FINAL_WAYPOINT_TOLERANCE = 0.30
 FINAL_YAW_TOLERANCE = 0.10
 DETOUR_DISTANCE = 0.50
 DETOUR_HEADING_TOLERANCE = 0.12
 RECOVER_HEADING_TOLERANCE = 0.12
 NO_PROGRESS_SECONDS = 8.0
 DETOUR_COOLDOWN_SECONDS = 2.5
-DETOUR_MAX_SECONDS = 35.0
-MAX_DETOURS_PER_WAYPOINT = 4
+DETOUR_MAX_SECONDS = 60.0
+DETOUR_BLOCKED_GRACE_SECONDS = 2.0
+DETOUR_BACKUP_SPEED = 0.06
+MAX_DETOURS_PER_WAYPOINT = 6
 
 
 def wrap(value: float) -> float:
@@ -63,10 +66,19 @@ class Pose:
 
 
 class GlobalDeliveryNavigator(Node):
-    def __init__(self, execute: bool, confirm: str, timeout: float, route: list[list[float]], final_yaw: float = FINAL_YAW) -> None:
+    def __init__(
+        self,
+        execute: bool,
+        confirm: str,
+        timeout: float,
+        route: list[list[float]],
+        final_yaw: float = FINAL_YAW,
+        ignore_obstacles: bool = False,
+    ) -> None:
         super().__init__("global_delivery_navigator")
         self.execute_enabled = execute and confirm == "deliver_nav_global"
         self.rejected = execute and confirm != "deliver_nav_global"
+        self.ignore_obstacles = bool(ignore_obstacles)
         self.timeout = max(1.0, float(timeout))
         self.route = [(float(x), float(y)) for x, y in route]
         self.final_yaw = float(final_yaw)
@@ -84,6 +96,7 @@ class GlobalDeliveryNavigator(Node):
         self.detour_started_at = 0.0
         self.detour_count = 0
         self.detour_cooldown_until = 0.0
+        self.detour_blocked_since = 0.0
         self.x: float | None = None
         self.y: float | None = None
         self.yaw: float | None = None
@@ -99,7 +112,7 @@ class GlobalDeliveryNavigator(Node):
         self.create_timer(0.05, self._tick)
         self.get_logger().warning(
             f"全局配送导航 mode={'EXECUTE' if self.execute_enabled else 'PLAN-ONLY'} "
-            f"waypoints={len(self.route)}"
+            f"waypoints={len(self.route)} ignore_obstacles={'on' if self.ignore_obstacles else 'off'}"
         )
 
     def _on_odom(self, message: Odometry) -> None:
@@ -168,7 +181,7 @@ class GlobalDeliveryNavigator(Node):
             return 0.0
         return math.hypot(goal[0] - self.x, goal[1] - self.y)
 
-    def _begin_detour(self, reason: str) -> bool:
+    def _begin_detour(self, reason: str, *, force_opposite: bool = False) -> bool:
         now = time.monotonic()
         if now < self.detour_cooldown_until:
             self._publish(Twist(), f"绕障冷却中，保持停车剩余={self.detour_cooldown_until - now:.1f}s")
@@ -183,8 +196,10 @@ class GlobalDeliveryNavigator(Node):
             self._stop(f"绕障失败：左右侧均过窄 left={left:.3f}m right={right:.3f}m")
             return False
 
-        # 选择更宽的一侧；若差异很小，保持上一轮方向，避免左右来回抖动。
-        if abs(left - right) < 0.08:
+        # 选择更宽的一侧；若当前侧前方持续堵塞，强制换到相反侧。
+        if force_opposite and self.detour_side in {-1, 1}:
+            side = -self.detour_side
+        elif abs(left - right) < 0.08:
             # 同一航点第二次绕障时换边，避免在对称障碍前反复走同一条死路。
             side = -self.detour_side if self.detour_count > 0 and self.detour_side in {-1, 1} else 1
         else:
@@ -195,6 +210,7 @@ class GlobalDeliveryNavigator(Node):
         self.detour_start = Pose(self.x or 0.0, self.y or 0.0, self.yaw)
         self.detour_started_at = now
         self.detour_count += 1
+        self.detour_blocked_since = 0.0
         self.state = "detour_turn"
         self.last_progress_at = now
         self._status("detour", reason)
@@ -226,7 +242,13 @@ class GlobalDeliveryNavigator(Node):
         if self.x is None or self.y is None or self.yaw is None:
             self._publish(Twist(), "等待 odom，保持停车")
             return
-        if time.monotonic() - self.last_scan > 1.0 or self.front is None:
+        if self.ignore_obstacles:
+            # 明确的无动态障碍单跑：不让静态场景边界/货架的 LaserScan
+            # 把配送直线路径误判为动态障碍；随机障碍正式模式仍走原绕障逻辑。
+            self.front = float("inf")
+            self.left = float("inf")
+            self.right = float("inf")
+        elif time.monotonic() - self.last_scan > 1.0 or self.front is None:
             self._publish(Twist(), "等待 LaserScan，保持停车")
             return
         if not self.execute_enabled:
@@ -273,16 +295,29 @@ class GlobalDeliveryNavigator(Node):
                 self._stop(f"绕障前进超时>{DETOUR_MAX_SECONDS:.0f}s")
                 return
             if self.front < DETOUR_FRONT_STOP:
-                # 不顶障碍：若当前侧的前方仍被挡住，先停车并等待恢复；
-                # 只有两侧都过窄才结束本次导航。
-                self._publish(Twist(), f"绕障期间前方过近 front={self.front:.3f}m，保持停车")
+                # 不能无限停车：携物状态下前方仍被挡住时，短暂停车确认，
+                # 随后强制切换到另一侧重新绕行，避免原地卡死到超时。
+                if self.detour_blocked_since <= 0.0:
+                    self.detour_blocked_since = now
+                blocked_for = now - self.detour_blocked_since
+                if blocked_for >= DETOUR_BLOCKED_GRACE_SECONDS:
+                    if self._begin_detour(
+                        f"绕障侧前方持续堵塞 {blocked_for:.1f}s，切换相反侧",
+                        force_opposite=True,
+                    ):
+                        return
+                self._publish(
+                    Twist(),
+                    f"绕障期间前方过近 front={self.front:.3f}m，等待换边 {blocked_for:.1f}s",
+                )
                 return
+            self.detour_blocked_since = 0.0
             if self._detour_distance() >= DETOUR_DISTANCE:
                 self.state = "recover"
                 self._status("recover", "绕障侧移完成，恢复目标方向")
                 return
             command = Twist()
-            command.linear.x = 0.045
+            command.linear.x = DETOUR_BACKUP_SPEED
             command.angular.z = max(-0.25, min(0.25, 1.0 * wrap(self.detour_heading - self.yaw)))
             self._publish(command, f"绕障前进 distance={self._detour_distance():.2f}/{DETOUR_DISTANCE:.2f}")
             return
@@ -304,18 +339,31 @@ class GlobalDeliveryNavigator(Node):
             self._publish(command, f"绕障后恢复目标方向 error={error:.2f}")
             return
 
-        # Normal waypoint tracking.
-        if distance <= WAYPOINT_TOLERANCE:
+        # Normal waypoint tracking. The final delivery-base waypoint is a
+        # safety region, not an exact point: once inside it, stop translating
+        # and only correct the final yaw.
+        waypoint_tolerance = (
+            FINAL_WAYPOINT_TOLERANCE
+            if self.waypoint_index == len(self.route) - 1
+            else WAYPOINT_TOLERANCE
+        )
+        if distance <= waypoint_tolerance:
             self.waypoint_index += 1
             self.state = "align"
             self.detour_count = 0
             self.detour_cooldown_until = 0.0
             self.last_distance = float("inf")
             self.last_progress_at = time.monotonic()
-            self._status("waypoint_reached", f"航点{self.waypoint_index}到达")
-            self.get_logger().info(f"到达航点 {self.waypoint_index}/{len(self.route)}")
+            self._status(
+                "waypoint_reached",
+                f"航点{self.waypoint_index}到达 tolerance={waypoint_tolerance:.2f}",
+            )
+            self.get_logger().info(
+                f"到达航点 {self.waypoint_index}/{len(self.route)} "
+                f"tolerance={waypoint_tolerance:.2f}"
+            )
             return
-        if self.front < FRONT_BLOCKED:
+        if not self.ignore_obstacles and self.front < FRONT_BLOCKED:
             if now < self.detour_cooldown_until:
                 self._publish(Twist(), f"绕障后仍有障碍，冷却中 front={self.front:.3f}m")
                 return
@@ -356,6 +404,11 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--route", default=json.dumps(DEFAULT_ROUTE))
     parser.add_argument("--final-yaw", type=float, default=FINAL_YAW, help="路线完成后的最终朝向（弧度）")
+    parser.add_argument(
+        "--ignore-obstacles",
+        action="store_true",
+        help="无动态障碍单跑：忽略 LaserScan 绕障判定；随机障碍正式模式不要使用",
+    )
     args = parser.parse_args()
     if args.execute and args.confirm != "deliver_nav_global":
         print("拒绝执行：必须使用 --confirm deliver_nav_global")
@@ -366,7 +419,14 @@ def main() -> int:
         print("路线JSON非法")
         return 2
     rclpy.init()
-    node = GlobalDeliveryNavigator(args.execute, args.confirm, args.timeout, route, args.final_yaw)
+    node = GlobalDeliveryNavigator(
+        args.execute,
+        args.confirm,
+        args.timeout,
+        route,
+        args.final_yaw,
+        ignore_obstacles=args.ignore_obstacles,
+    )
     try:
         while rclpy.ok() and not node.done:
             rclpy.spin_once(node, timeout_sec=0.1)

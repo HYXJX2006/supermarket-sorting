@@ -274,10 +274,25 @@ class DryRunExecutor(Node):
         self.create_subscription(LaserScan, SCAN_TOPIC, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(String, NAV_STATUS_TOPIC, self._on_navigation_status, 10)
         self.zero_pub = self.create_publisher(Twist, CMD_VEL_TOPIC, 10)
-        self.navigation_goal_pub = self.create_publisher(PoseStamped, NAV_GOAL_TOPIC, 10)
-        self.navigation_meta_pub = self.create_publisher(String, NAV_META_TOPIC, 10)
         self.target_status_pub = self.create_publisher(String, TARGET_STATUS_TOPIC, 10)
+        # 导航目标需要支持晚启动的动态导航器：使用可靠、瞬态本地 QoS，
+        # 并在导航未到位前按低频重发，避免一次性 PoseStamped 被错过。
+        navigation_goal_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.navigation_goal_pub = self.create_publisher(
+            PoseStamped, NAV_GOAL_TOPIC, navigation_goal_qos
+        )
+        self.navigation_meta_pub = self.create_publisher(
+            String, NAV_META_TOPIC, navigation_goal_qos
+        )
         self.last_navigation_goal_key = ""
+        self.last_navigation_goal_publish_at = 0.0
+        self.navigation_goal_republish_seconds = max(
+            0.2, float(os.getenv("SUPERMARKET_NAV_GOAL_REPUBLISH_SECONDS", "1.0"))
+        )
         self.navigation_state = "unknown"
         self.grasp_goal_pub = self.create_publisher(PoseStamped, GRASP_GOAL_TOPIC, 10)
         self.grasp_meta_pub = self.create_publisher(String, GRASP_META_TOPIC, 10)
@@ -756,7 +771,37 @@ class DryRunExecutor(Node):
         }
         self.get_logger().info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
-    def _publish_navigation_goal(self, target: TargetState, candidate: StableCandidate) -> None:
+    def _publish_locked_navigation_goal(self, target: TargetState) -> None:
+        """从已锁定候选重建导航目标，供 QoS/低频重发使用。"""
+        if not target.candidate:
+            return
+        raw_world = target.candidate.get("world")
+        if not isinstance(raw_world, (list, tuple)) or len(raw_world) < 3:
+            return
+        try:
+            world = tuple(float(value) for value in raw_world[:3])
+            candidate = StableCandidate(
+                track_id=str(target.candidate.get("track_id", "locked")),
+                kind=target.kind,
+                confidence=float(target.candidate.get("confidence", 0.0)),
+                world=world,
+                aruco_ids=tuple(int(value) for value in target.candidate.get("aruco_ids", [])),
+                slot=target.candidate.get("slot"),
+                samples=int(target.candidate.get("samples", 0)),
+                first_seen=time.monotonic(),
+                last_seen=time.monotonic(),
+            )
+        except (TypeError, ValueError):
+            return
+        self._publish_navigation_goal(target, candidate, force=True)
+
+    def _publish_navigation_goal(
+        self,
+        target: TargetState,
+        candidate: StableCandidate,
+        *,
+        force: bool = False,
+    ) -> None:
         """把锁定商品转换成底盘观察点；只发布目标，不发布速度。"""
         wx, wy, _ = candidate.world
         shelf_group = candidate.slot.split("/", 1)[0] if candidate.slot and "/" in candidate.slot else None
@@ -781,7 +826,7 @@ class DryRunExecutor(Node):
             },
             sort_keys=True,
         )
-        if key == self.last_navigation_goal_key:
+        if key == self.last_navigation_goal_key and not force:
             return
 
         stamp = self.get_clock().now().to_msg()
@@ -811,6 +856,7 @@ class DryRunExecutor(Node):
             separators=(",", ":"),
         )
         self.navigation_meta_pub.publish(meta)
+        self.last_navigation_goal_publish_at = time.monotonic()
         # target_status 也携带导航目标，避免编排器在一次性 nav_meta 消息发布前后启动
         # approach_target worker 时丢失目标；这仍然只是 PoseStamped 计划，不是速度命令。
         target.candidate["navigation_goal"] = [round(gx, 4), round(gy, 4), round(goal_yaw, 4)]
@@ -935,10 +981,20 @@ class DryRunExecutor(Node):
         # 已经锁定的有效候选是单目标闭环的事实来源；后续短暂丢失 ArUco
         # 或检测抖动不能覆盖它，避免抓取计划突然变成无货位/错误货位。
         if target.candidate_locked:
+            # 动态导航器可能晚于编排器启动；即使 DDS 瞬态本地缓存尚未完成，
+            # 也以 1 Hz 左右重发同一个目标，直到目标专属导航真正到位。
+            if (
+                target.status == "searching"
+                and target.candidate
+                and self.navigation_state not in {"reached", "failed"}
+                and now - self.last_navigation_goal_publish_at
+                >= self.navigation_goal_republish_seconds
+            ):
+                self._publish_locked_navigation_goal(target)
             if now - self.last_report_at >= 3.0:
                 self.get_logger().info(
                     f"dry-run 候选已锁定，保持货位={target.candidate.get('slot') if target.candidate else None}；"
-                    f"target={target.target_id}"
+                    f"target={target.target_id} navigation_state={self.navigation_state}"
                 )
                 self.last_report_at = now
             return

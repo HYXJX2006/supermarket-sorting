@@ -79,6 +79,8 @@ class Target:
     navigation_meta: dict[str, Any] | None = None
     grasp_meta: dict[str, Any] | None = None
     grasp_plan: dict[str, Any] | None = None
+    plan_only_allowed: bool = False
+    recheck_gate_active: bool = False
     attempts: int = 0
     error: str | None = None
 
@@ -349,7 +351,10 @@ class SingleItemExecutor(Node):
         target = next((item for item in self.targets if item.target_id == target_id), None)
         if target is None:
             return
+        target.recheck_gate_active = True
         target.status = str(current.get("status", target.status))
+        if current.get("plan_only_allowed") is True:
+            target.plan_only_allowed = True
         # 感知节点可能周期性重复发布旧的 attempts=0；不能让外部快照
         # 覆盖执行器已经累计的重试次数，否则失败目标永远无法被跳过。
         reported_attempts = int(current.get("attempts", target.attempts) or 0)
@@ -372,6 +377,14 @@ class SingleItemExecutor(Node):
             target.navigation_meta = {"navigation_goal": payload["navigation_goal"]}
         if isinstance(payload.get("object_world"), list):
             target.grasp_meta = payload
+            if "plan_only_allowed" in payload or target.recheck_gate_active:
+                target.plan_only_allowed = (
+                    payload.get("plan_only_allowed") is True
+                    and payload.get("local_recheck_required") is not True
+                )
+            else:
+                # 兼容未接入库存编排器的官方单目标流程。
+                target.plan_only_allowed = True
         self._switch_to_target_navigation_if_ready(target)
         if (
             self.current is target
@@ -447,6 +460,10 @@ class SingleItemExecutor(Node):
             return
         target.grasp_meta = payload
         target.candidate = payload
+        target.plan_only_allowed = (
+            payload.get("plan_only_allowed") is True
+            and payload.get("local_recheck_required") is not True
+        ) if ("plan_only_allowed" in payload or target.recheck_gate_active) else True
         if self.current is target:
             self.grasp_meta = payload
 
@@ -598,6 +615,13 @@ class SingleItemExecutor(Node):
         stage = self._stage_name()
         # plan-only 也必须实际收到 grasp_planner 的 IK 输出，不能把 deploy
         # 及后续动作仅当作标签顺序演练。IK 不通过时停在硬门槛前。
+        if (
+            stage in {"deploy", "creep", "close_gripper", "lift", "retreat"}
+            and self.current.recheck_gate_active
+            and not self.current.plan_only_allowed
+        ):
+            self._emit("waiting_local_recheck", "局部复核尚未通过，禁止进入 IK/机械臂阶段", stage=stage)
+            return
         if stage in {"deploy", "creep", "close_gripper", "lift", "retreat"}:
             plan = self.current.grasp_plan
             if plan is None:
@@ -625,6 +649,13 @@ class SingleItemExecutor(Node):
                 return
             self._publish_plan(stage, "目标已锁定，先导航到目标专属预抓取点")
             self._advance_after_success()
+            return
+        if (
+            stage in {"deploy", "creep", "close_gripper", "lift", "retreat"}
+            and self.current.recheck_gate_active
+            and not self.current.plan_only_allowed
+        ):
+            self._emit("waiting_local_recheck", "局部复核尚未通过，禁止启动真实机械臂 worker", stage=stage)
             return
         if self.current.grasp_meta is None and stage in {"deploy", "creep", "close_gripper", "lift"}:
             self._emit("waiting_target_lock", "等待抓取元数据")

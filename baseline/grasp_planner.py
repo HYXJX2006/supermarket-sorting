@@ -102,12 +102,16 @@ class GraspPlanner(Node):
         transform[:3, :3] = GRASP_ROT
         transform[:3, 3] = footprint
         current_slide = float(self.slide)
+        # 与真实 deploy worker 一致：为后续 lift 保留 0.05m 行程。
+        slide_search_min = max(SLIDE_GRASP, SLIDE_MIN)
         slide_candidates = [
-            round(SLIDE_MIN + index * SLIDE_STEP, 3)
-            for index in range(int(round((SLIDE_MAX - SLIDE_MIN) / SLIDE_STEP)) + 1)
+            round(slide_search_min + index * SLIDE_STEP, 3)
+            for index in range(int(round((SLIDE_MAX - slide_search_min) / SLIDE_STEP)) + 1)
         ]
         slide_candidates.sort(key=lambda value: abs(value - current_slide))
         last_exception = None
+        best_result = None
+        best_score = None
         for slide_candidate in slide_candidates:
             ref = np.array([slide_candidate, *self.right_arm], dtype=float)
             try:
@@ -122,20 +126,32 @@ class GraspPlanner(Node):
                 continue
             if solutions is None or len(solutions) == 0:
                 continue
-            joints = np.asarray(solutions[0], dtype=float)
-            try:
-                _, fk_right = self.kdl.forward_kinematics(joints, index="right")
-                position_error = float(np.linalg.norm(fk_right[:3, 3] - footprint))
-            except Exception:
-                position_error = None
+            for solution in solutions:
+                joints = np.asarray(solution, dtype=float).reshape(-1)
+                if joints.size < 7 or not np.all(np.isfinite(joints[:7])):
+                    continue
+                joints = joints[:7]
+                try:
+                    _, fk_right = self.kdl.forward_kinematics(joints, index="right")
+                    position_error = float(np.linalg.norm(fk_right[:3, 3] - footprint))
+                    relative = GRASP_ROT.T @ np.asarray(fk_right[:3, :3], dtype=float)
+                    cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
+                    rotation_error = float(math.acos(cosine))
+                except Exception:
+                    continue
+                joint_delta = float(np.linalg.norm(joints - ref))
+                score = position_error + 0.02 * rotation_error + 0.001 * joint_delta
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_result = (joints, position_error)
+        if best_result is not None:
+            joints, position_error = best_result
             return {
                 "reachable": True,
                 "footprint": [round(float(v), 5) for v in footprint],
                 "slide": round(float(joints[0]), 5),
                 "right_arm_joints": [round(float(v), 5) for v in joints[1:7]],
-                "ik_position_error_m": (
-                    round(position_error, 6) if position_error is not None else None
-                ),
+                "ik_position_error_m": round(float(position_error), 6),
             }
         suffix = f": {last_exception}" if last_exception else ""
         return {
@@ -173,12 +189,7 @@ class GraspPlanner(Node):
             "mechanical_commands_sent": False,
             "target_id": target_id,
             "kind": kind,
-            "grasp_geometry": {
-                "shape": "cylindrical_container" if kind.strip().lower() == "shupian" else "default",
-                "surface_to_center_fwd": round(float(geometry.surface_to_center_fwd), 5),
-                "deploy_offset": [round(float(v), 5) for v in geometry.deploy_offset],
-                "creep_stop_dy": round(float(geometry.creep_stop_dy), 5),
-            },
+            "grasp_geometry": geometry.to_dict(),
             "slot": payload.get("slot"),
             "input_object_world": [round(float(v), 5) for v in object_world],
             "object_center_world": [round(float(v), 5) for v in object_center],
@@ -187,7 +198,7 @@ class GraspPlanner(Node):
             "creep_stop_y": round(creep_stop, 5),
             "slide_grasp": SLIDE_GRASP,
             "slide_lift": SLIDE_LIFT,
-            "grip": {"open": 1.0, "close": 0.08},
+            "grip": {"open": 1.0, "close": round(float(geometry.grip_close), 5)},
             "stages": ["deploy", "creep", "close_gripper", "lift", "retreat"],
             "ik": ik,
             "base_at_plan": {

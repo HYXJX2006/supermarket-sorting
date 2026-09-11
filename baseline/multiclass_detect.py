@@ -27,6 +27,17 @@ import numpy as np
 
 
 TASK_DIR = Path("/workspace/supermarket_sorting_task/examples/supermarket_sorting")
+# Client 镜像可能没有完整的官方 task tree；baseline 挂载中保留了官方副本。
+# 优先使用镜像内路径，缺失时自动回退，避免依赖启动脚本额外拼接 PYTHONPATH。
+if not (TASK_DIR / "perception" / "backends.py").is_file():
+    bundled_task_dir = Path(__file__).resolve().parent / "official_baseline" / "examples" / "supermarket_sorting"
+    if (bundled_task_dir / "perception" / "backends.py").is_file():
+        TASK_DIR = bundled_task_dir
+# Client fallback 还需要把 official_baseline 根目录加入 sys.path，
+# 这样 kele_detect.py 才能导入 discoverse 包。
+BUNDLED_ROOT = Path(__file__).resolve().parent / "official_baseline"
+if BUNDLED_ROOT.is_dir():
+    sys.path.insert(0, str(BUNDLED_ROOT))
 PERCEPTION_DIR = TASK_DIR / "perception"
 sys.path.insert(0, str(TASK_DIR))
 sys.path.insert(0, str(PERCEPTION_DIR))
@@ -67,6 +78,10 @@ DISPLAY_SHOW_CONF = os.getenv("SUPERMARKET_DISPLAY_SHOW_CONF", "1").strip().lowe
 DISPLAY_SHOW_WORLD = os.getenv("SUPERMARKET_DISPLAY_SHOW_WORLD", "0").strip().lower() in {"1", "true", "yes", "on"}
 DISPLAY_FONT_SCALE = max(0.35, min(0.8, float(os.getenv("SUPERMARKET_DISPLAY_FONT_SCALE", "0.5"))))
 DISPLAY_LINE_THICKNESS = max(1, min(3, int(os.getenv("SUPERMARKET_DISPLAY_LINE_THICKNESS", "2"))))
+# 商品框应是局部目标；超大框通常来自墙面、地面或货架结构误检。
+MAX_BOX_WIDTH_FRAC = max(0.10, min(0.80, float(os.getenv("SUPERMARKET_MAX_BOX_WIDTH_FRAC", "0.30"))))
+MAX_BOX_HEIGHT_FRAC = max(0.15, min(0.90, float(os.getenv("SUPERMARKET_MAX_BOX_HEIGHT_FRAC", "0.45"))))
+MAX_BOX_AREA_FRAC = max(0.02, min(0.50, float(os.getenv("SUPERMARKET_MAX_BOX_AREA_FRAC", "0.12"))))
 
 
 class MultiClassYoloBackend(YoloBackend):
@@ -84,6 +99,10 @@ class MultiClassYoloBackend(YoloBackend):
             return []
 
         results = self.model(rgb, conf=self.conf_thresh, verbose=False)[0]
+        image_height, image_width = rgb.shape[:2]
+        max_box_width = image_width * MAX_BOX_WIDTH_FRAC
+        max_box_height = image_height * MAX_BOX_HEIGHT_FRAC
+        max_box_area = image_width * image_height * MAX_BOX_AREA_FRAC
         detections = []
         for box in results.boxes:
             conf = float(box.conf.item())
@@ -93,13 +112,21 @@ class MultiClassYoloBackend(YoloBackend):
             if cls_id >= len(self.CLASS_NAMES):
                 continue
             x0, y0, x1, y1 = map(int, box.xyxy[0].cpu().numpy())
+            box_width = max(1, x1 - x0)
+            box_height = max(1, y1 - y0)
+            if (
+                box_width > max_box_width
+                or box_height > max_box_height
+                or box_width * box_height > max_box_area
+            ):
+                continue
             detections.append(
                 {
                     "class": self.CLASS_NAMES[cls_id],
                     "x": (x0 + x1) // 2,
                     "y": (y0 + y1) // 2,
-                    "w": max(1, x1 - x0),
-                    "h": max(1, y1 - y0),
+                    "w": box_width,
+                    "h": box_height,
                     "conf": conf,
                 }
             )
@@ -300,6 +327,7 @@ class MultiClassDetectNode(KeleDetectNode):
         self._capture_save_frame(save_stamp, stage=f"every_{self.capture_every_n}_rgb")
 
     def depth_cb(self, msg: Image):
+        self.depth_callback_count += 1
         try:
             self.capture_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
         except Exception as exc:
@@ -308,6 +336,12 @@ class MultiClassDetectNode(KeleDetectNode):
 
     def rgb_cb(self, msg: Image):
         """复用官方坐标链路，但仅在调试图上绘制紧凑短标签。"""
+        self.rgb_callback_count += 1
+        if self.rgb_callback_count in (1, 10) or self.rgb_callback_count % 300 == 0:
+            self.get_logger().info(
+                f"视觉输入状态：rgb={self.rgb_callback_count} depth={self.depth_callback_count} "
+                f"detections={self.detection_publish_count}"
+            )
         try:
             self.capture_rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             self.capture_rgb_input_frame += 1
@@ -364,6 +398,7 @@ class MultiClassDetectNode(KeleDetectNode):
                 vis, label, (text_x + 2, text_y), cv2.FONT_HERSHEY_SIMPLEX,
                 DISPLAY_FONT_SCALE, (255, 255, 255), 1, cv2.LINE_AA
             )
+        self.detection_publish_count += len(out)
         self.publish_detections(out, msg.header.stamp)
         if self.pub_res_img:
             self.img_pub.publish(self.bridge.cv2_to_imgmsg(vis, "bgr8"))
@@ -397,13 +432,23 @@ class MultiClassDetectNode(KeleDetectNode):
             "SUPERMARKET_CAPTURE_DIR",
             "/workspace/baseline/debug_data/recognition_current",
         ))
-        self.capture_dir.mkdir(parents=True, exist_ok=True)
+        self.capture_dir.parent.mkdir(parents=True, exist_ok=True)
         if self.capture_enabled:
-            for child in list(self.capture_dir.iterdir()):
-                if child.is_dir() and not child.is_symlink():
-                    shutil.rmtree(child)
-                else:
-                    child.unlink()
+            # 当前目录可能包含长时间运行产生的数十万张图片；逐文件删除会
+            # 阻塞检测器启动。通过同文件系统原子改名归档，立即释放当前目录，
+            # 再创建空目录供本轮写入。归档目录不参与本轮识别。
+            if self.capture_dir.exists() and any(self.capture_dir.iterdir()):
+                archive_root = self.capture_dir.parent / "recognition_runs"
+                archive_root.mkdir(parents=True, exist_ok=True)
+                archive_dir = archive_root / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                try:
+                    self.capture_dir.rename(archive_dir)
+                    self.get_logger().info(f"识别留档旧目录已原子归档：{archive_dir}")
+                except OSError as exc:
+                    # 只读挂载或跨文件系统时不阻塞检测器启动；当前目录
+                    # 保留旧文件，但本轮仍继续运行并通过 session.json 标识。
+                    self.get_logger().warning(f"识别留档旧目录归档失败，继续复用：{exc}")
+            self.capture_dir.mkdir(parents=True, exist_ok=True)
         self.capture_frame_index = 0
         self.capture_rgb_input_frame = 0
         self.capture_pending = False
@@ -417,6 +462,9 @@ class MultiClassDetectNode(KeleDetectNode):
         self.capture_result = None
         self.capture_detections = []
         self.capture_task = None
+        self.rgb_callback_count = 0
+        self.depth_callback_count = 0
+        self.detection_publish_count = 0
         self.create_subscription(Image, "/multiclass/result_image", self._capture_result_cb, 5)
         self.create_subscription(Detection3DArray, "/multiclass/detections", self._capture_detection_cb, 10)
         task_qos = QoSProfile(

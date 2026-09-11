@@ -75,14 +75,10 @@ class LowSpeedNavigator(Node):
         goal_topic: str | None,
         route: list[tuple[float, float, float]] | None = None,
         pickup_approach: bool = False,
-        pickup_exact: bool = False,
         pickup_transit: bool = False,
-        ignore_obstacles: bool = False,
-        pickup_safe_distance: float = 0.30,
-        pickup_lateral_tolerance: float = 0.08,
+        pickup_safe_distance: float = 0.25,
         drive_speed_gain: float = 0.35,
         avoid_clearance: float = 0.55,
-        planned_route: bool = False,
         backup_speed: float = 0.15,
         backup_seconds: float = 2.0,
     ) -> None:
@@ -102,23 +98,14 @@ class LowSpeedNavigator(Node):
         self.segment_start: tuple[float, float] | None = None
         self.goal_received = goal_topic is None
         self.goal_topic = goal_topic
-        # In pickup-approach mode each dynamic goal is one axis-aligned
-        # segment. Lock its initial travel heading so pose drift cannot turn a
-        # pure east/west/north segment into diagonal chasing.
-        self.pickup_heading_target: float | None = None
         # 目标货架接近阶段：货架会出现在雷达正前方，不能把货架本体
         # 当作需要绕开的动态障碍。该开关只由 approach_target worker 使用；
         # 取货前安全路线和配送路线仍保留 LaserScan 避障。
         self.pickup_approach = bool(pickup_approach)
-        self.pickup_exact = bool(pickup_exact)
         self.pickup_transit = bool(pickup_transit)
-        # 无障碍开发单跑：关闭雷达干预，但保留普通目标距离/航向控制。
-        self.ignore_obstacles = bool(ignore_obstacles)
         # 货架/商品碰撞体会让底盘在安全边界外停止；接近模式允许
         # 在安全距离内结束导航，避免继续等待不可达的几何目标。
         self.pickup_safe_distance = max(0.05, float(pickup_safe_distance))
-        self.pickup_lateral_tolerance = max(0.02, float(pickup_lateral_tolerance))
-        self.planned_route = bool(planned_route)
         if self.pickup_approach and self.pickup_transit:
             raise ValueError("pickup_approach 与 pickup_transit 不能同时启用")
         self.max_speed = max(0.0, float(max_speed))
@@ -160,12 +147,6 @@ class LowSpeedNavigator(Node):
         self._ranges: list[float] = []
         self._scan_angle_min = 0.0
         self._scan_angle_inc = 0.0
-        # pickup-approach 朝向滞回：避免在临界误差附近反复切换
-        # “原地旋转/前进”，导致返程接近货架时停滞。
-        self._pickup_heading_ready = False
-        # 轴向接近越过目标后锁存反向方向，直到当前动态目标结束。
-        # 不能仅按每一帧的剩余距离切换，否则会在目标容差边界来回掉头。
-        self._pickup_reverse_latched = False
 
         self.cmd_pub = self.create_publisher(Twist, CMD_TOPIC, 10)
         self.status_pub = self.create_publisher(String, STATUS_TOPIC, 10)
@@ -181,7 +162,6 @@ class LowSpeedNavigator(Node):
             f"goal_topic={self.goal_topic or 'cli'}；"
             f"pickup_approach={'on' if self.pickup_approach else 'off'}；"
             f"pickup_transit={'on' if self.pickup_transit else 'off'}；"
-            f"planned_route={'on' if self.planned_route else 'off'}；"
             "只控制底盘，不控制机械臂"
         )
 
@@ -211,23 +191,17 @@ class LowSpeedNavigator(Node):
             2.0 * (pose.orientation.w * pose.orientation.z),
             1.0 - 2.0 * (pose.orientation.z * pose.orientation.z),
         )
+        # 动态目标模式每次收到新目标都从该目标重新开始，不沿用旧航点。
+        self.route = [(self.goal_x, self.goal_y, self.goal_yaw)]
+        self.route_index = 0
+        self.goal_received = True
         goal_key = f"{self.goal_x:.4f},{self.goal_y:.4f},{self.goal_yaw:.4f}"
-        # 编排器会周期性重发同一个目标，重复消息不能重置
-        # pickup_heading_target / reverse latch；否则越点回收会被重新
-        # 当成正向接近，在目标线附近反复掉头。
-        new_goal = goal_key != self.last_goal_key
-        if new_goal:
-            self.route = [(self.goal_x, self.goal_y, self.goal_yaw)]
-            self.route_index = 0
-            self.pickup_heading_target = None
-            self._pickup_heading_ready = False
-            self._pickup_reverse_latched = False
+        if goal_key != self.last_goal_key:
             self.last_goal_key = goal_key
             self._publish_status("active", "收到新导航目标")
             self.get_logger().info(
                 f"收到导航目标：({self.goal_x:.3f},{self.goal_y:.3f},yaw={self.goal_yaw:.3f})"
             )
-        self.goal_received = True
 
     def _on_odom(self, message: Odometry) -> None:
         pose = message.pose.pose
@@ -347,9 +321,7 @@ class LowSpeedNavigator(Node):
             self._publish(Twist())
             self._periodic_log("等待 odom，保持停车")
             return
-        if now - self.last_scan_at > 1.0 and not (
-            self.pickup_approach or self.pickup_transit or self.ignore_obstacles
-        ):
+        if now - self.last_scan_at > 1.0 and not (self.pickup_approach or self.pickup_transit):
             self._publish(Twist())
             self._periodic_log("LaserScan 超时，保持停车")
             return
@@ -358,39 +330,17 @@ class LowSpeedNavigator(Node):
         dy = self.goal_y - self.y
         distance = math.hypot(dx, dy)
         arrival_tolerance = self.goal_tolerance
-        transit_axis_done = False
-        if self.pickup_transit:
-            # Formal transit goals are axis-aligned. Once the robot crosses
-            # the commanded axis coordinate, treat the waypoint as reached;
-            # Euclidean distance alone would keep driving past it because the
-            # heading is intentionally locked to the segment direction.
-            arrival_tolerance = max(arrival_tolerance, 0.16)
-            segment_dx = math.cos(self.goal_yaw)
-            segment_dy = math.sin(self.goal_yaw)
-            remaining_along_segment = dx * segment_dx + dy * segment_dy
-            transit_axis_done = remaining_along_segment <= arrival_tolerance
         # pickup-approach 的目标点可能落在货架碰撞体内部。此时底盘
         # 的物理可达终点是货架外安全边界，而不是目标坐标本身。
         # 仅对无多段 route 的目标接近启用，避免跳过中间航点。
-        pickup_arrival_tolerance = self.pickup_safe_distance + 0.05
-        # pickup-approach 的宽松距离只能用于最终法向接近；横向对齐和
-        # 机械臂预抓取安全线使用 pickup-exact，必须满足普通位置容差。
-        segment_dx = math.cos(self.goal_yaw)
-        segment_dy = math.sin(self.goal_yaw)
-        lateral_error = abs(dx * (-segment_dy) + dy * segment_dx)
-        normal_approach_axis = abs(abs(wrap_to_pi(self.goal_yaw)) - math.pi / 2.0) <= 0.20
-        # 横向换列段（yaw=0/π）必须精确到目标 x；只有货架法向段
-        # （yaw=±π/2）才允许在货架外安全距离提前结束。
-        exact_arrival = self.pickup_exact or not normal_approach_axis
         safe_arrival = (
             self.pickup_approach
-            and len(self.route) == 1
-            and distance <= (self.goal_tolerance if exact_arrival else pickup_arrival_tolerance)
-            and lateral_error <= self.pickup_lateral_tolerance
+            and not self.route
+            and distance <= self.pickup_safe_distance
         )
         if safe_arrival:
-            arrival_tolerance = pickup_arrival_tolerance
-        if distance <= arrival_tolerance or transit_axis_done:
+            arrival_tolerance = self.pickup_safe_distance
+        if distance <= arrival_tolerance:
             yaw_error = wrap_to_pi(self.goal_yaw - self.yaw)
             if abs(yaw_error) <= self.yaw_tolerance:
                 if self.route_index + 1 < len(self.route):
@@ -420,23 +370,12 @@ class LowSpeedNavigator(Node):
             return
 
         goal_heading = math.atan2(dy, dx)
-        if self.pickup_approach or self.pickup_transit:
-            if self.pickup_heading_target is None:
-                # Executor supplies an axis-aligned goal_yaw for every formal
-                # shelf-entry segment. Use that commanded axis directly;
-                # deriving heading from a drifting pose creates diagonal
-                # chasing and oscillation near the corridor boundary.
-                self.pickup_heading_target = wrap_to_pi(self.goal_yaw)
-            drive_heading = self.pickup_heading_target
-        else:
-            drive_heading = goal_heading
-        heading_error = wrap_to_pi(drive_heading - self.yaw)
+        heading_error = wrap_to_pi(goal_heading - self.yaw)
         command = Twist()
 
         front_blocked = (
             not self.pickup_approach
             and not self.pickup_transit
-            and not self.ignore_obstacles
             and self.front_min is not None
             and self.front_min < self.obstacle_distance
         )
@@ -491,138 +430,27 @@ class LowSpeedNavigator(Node):
         if self.pickup_approach:
             # 这里是货架外侧到目标观察位的最后接近段：不读取 front/left/right
             # 做主动绕行，也不启用停滞倒车；只按 odom 直达目标并在容差内对齐 yaw。
-            # 返程接近货架时必须先把底盘转正，避免一边横向靠近一边
-            # 大角度转向，斜穿货架/中间挡板或跑到最右侧墙边。
             self.avoid_since = None
             self.backup_until = None
             self._stuck_since = None
             self._stuck_backup_until = None
-            # 朝向控制使用滞回：首次接近时将误差收敛到 0.18 rad 以内；
-            # 已进入推进状态后，只有误差重新超过 0.35 rad 才重新原地对齐。
-            # 这样可以避免 0.30 rad 附近因 odom 噪声反复切换，造成原地抖动。
-            # 轴向 pickup 航点可能因仿真步长/底盘惯性越过目标；
-            # 越过后必须反向回收，否则锁定原方向会一直驶离目标。
-            remaining_along = dx * segment_dx + dy * segment_dy
-            if not self._pickup_reverse_latched and remaining_along < -self.goal_tolerance:
-                # 已经越过目标：本目标内锁存反向回收，直到距离门禁触发。
-                # 不在 remaining_along 穿越 +/- tolerance 时再次切回正向。
-                self._pickup_reverse_latched = True
-                self._periodic_log(
-                    f"pickup-approach overshoot reverse latched pos=({self.x:.2f},{self.y:.2f}) "
-                    f"remaining={remaining_along:.2f}"
-                )
-            desired_heading = wrap_to_pi(
-                self.goal_yaw + math.pi if self._pickup_reverse_latched else self.goal_yaw
-            )
-            heading_changed = (
-                self.pickup_heading_target is None
-                or abs(wrap_to_pi(desired_heading - self.pickup_heading_target)) > 0.02
-            )
-            if heading_changed:
-                self.pickup_heading_target = desired_heading
-                self._pickup_heading_ready = False
-            drive_heading = self.pickup_heading_target
-            heading_error = wrap_to_pi(drive_heading - self.yaw)
-            if not self._pickup_heading_ready:
-                if abs(heading_error) > 0.18:
-                    command.linear.x = 0.0
-                    command.angular.z = max(
-                        -self.max_angular,
-                        min(self.max_angular, 1.8 * heading_error),
-                    )
-                    self._publish(command)
-                    self._periodic_log(
-                        f"pickup-approach turn-in-place pos=({self.x:.2f},{self.y:.2f}) "
-                        f"dist={distance:.2f} heading_err={heading_error:.2f} "
-                        "（先对齐朝向，忽略货架雷达障碍）"
-                    )
-                    return
-                self._pickup_heading_ready = True
-                self._periodic_log(
-                    f"pickup-approach heading aligned err={heading_error:.2f}，恢复前进"
-                )
-            elif abs(heading_error) > 0.35:
-                self._pickup_heading_ready = False
-                command.linear.x = 0.0
-                command.angular.z = max(
-                    -self.max_angular,
-                    min(self.max_angular, 1.8 * heading_error),
-                )
-                self._publish(command)
-                self._periodic_log(
-                    f"pickup-approach re-align turn-in-place pos=({self.x:.2f},{self.y:.2f}) "
-                    f"dist={distance:.2f} heading_err={heading_error:.2f} "
-                    "（误差超滞回上限，先对齐朝向）"
-                )
-                return
             alignment = max(0.0, math.cos(heading_error))
             command.linear.x = min(self.max_speed, 0.45 * distance * alignment)
-            # Once a pickup segment is aligned, damp yaw correction heavily.
-            # The previous 1.8 gain plus the hysteresis threshold caused the
-            # differential base to overshoot, re-enter turn-in-place, and stall
-            # on long east/north/west bypass segments.
             command.angular.z = max(
-                -min(self.max_angular, 0.08),
-                min(min(self.max_angular, 0.08), 0.5 * heading_error),
+                -self.max_angular,
+                min(self.max_angular, 1.8 * heading_error),
             )
             self._publish(command)
             self._periodic_log(
                 f"pickup-approach pos=({self.x:.2f},{self.y:.2f}) dist={distance:.2f} "
-                f"heading_err={heading_error:.2f} drive_heading={drive_heading:.2f}"
-                "（锁定航点方向，忽略货架雷达障碍）"
+                f"heading_err={heading_error:.2f}（忽略货架雷达障碍）"
             )
             return
 
         if self.pickup_transit:
-            # Formal shelf-entry segments are axis-aligned. Do not translate
-            # while turning: mixing angular correction with forward velocity
-            # made the base drift into the south boundary and stall.
-            self.avoid_since = None
-            self.backup_until = None
-            self._stuck_since = None
-            self._stuck_backup_until = None
-            if not self._pickup_heading_ready:
-                if abs(heading_error) > 0.25:
-                    command.linear.x = 0.0
-                    command.angular.z = max(
-                        -self.max_angular,
-                        min(self.max_angular, 1.5 * heading_error),
-                    )
-                    self._publish(command)
-                    self._periodic_log(
-                        f"pickup-transit turn-in-place pos=({self.x:.2f},{self.y:.2f}) "
-                        f"dist={distance:.2f} heading_err={heading_error:.2f}"
-                    )
-                    return
-                self._pickup_heading_ready = True
-                self._periodic_log(
-                    f"pickup-transit heading aligned err={heading_error:.2f}，开始轴向直行"
-                )
-            elif abs(heading_error) > 0.80:
-                self._pickup_heading_ready = False
-                command.linear.x = 0.0
-                command.angular.z = max(
-                    -self.max_angular,
-                    min(self.max_angular, 1.5 * heading_error),
-                )
-                self._publish(command)
-                self._periodic_log(
-                    f"pickup-transit re-align turn-in-place pos=({self.x:.2f},{self.y:.2f}) "
-                    f"dist={distance:.2f} heading_err={heading_error:.2f}"
-                )
-                return
-            command.linear.x = min(self.max_speed, self.drive_speed_gain * distance)
-            command.angular.z = max(-0.03, min(0.03, 0.08 * heading_error))
-            self._publish(command)
-            self._periodic_log(
-                f"pickup-transit pos=({self.x:.2f},{self.y:.2f}) dist={distance:.2f} "
-                f"heading_err={heading_error:.2f}（轴向直行，忽略配送避障）"
-            )
-            return
-
-        if self.ignore_obstacles:
-            # 无障碍单跑只跳过 LaserScan 安全干预；这里仍按普通目标
-            # 的距离和航向控制，不能复用 pickup-approach 的安全距离语义。
+            # 起点到首个 E 货架过渡点是官方无障碍直行段。这里不启用配送
+            # 阶段的 LaserScan 主动绕行、雷达超时停车或停滞倒车；只用
+            # odom 做直线方向、横向误差和最终姿态控制。
             self.avoid_since = None
             self.backup_until = None
             self._stuck_since = None
@@ -635,8 +463,8 @@ class LowSpeedNavigator(Node):
             )
             self._publish(command)
             self._periodic_log(
-                f"ignore-obstacles pos=({self.x:.2f},{self.y:.2f}) dist={distance:.2f} "
-                f"heading_err={heading_error:.2f}"
+                f"pickup-transit pos=({self.x:.2f},{self.y:.2f}) dist={distance:.2f} "
+                f"heading_err={heading_error:.2f}（首段固定直行，忽略配送避障）"
             )
             return
 
@@ -681,12 +509,9 @@ class LowSpeedNavigator(Node):
         self.avoid_since = None
         self.backup_until = None
 
-        # 通用停滞脱困：预规划配送路线已经由膨胀障碍 A* 保证可行，
-        # 不再用倒车把底盘拉离路线；非预规划导航仍保留原逻辑。
+        # 通用停滞脱困：2 秒窗口内位移不足 5cm 且目标还有距离时，倒车
+        # 拉开重新定位，避免被侧向障碍顶住原地打转。
         now = time.monotonic()
-        if self.planned_route:
-            self._stuck_since = None
-            self._stuck_backup_until = None
         self._pos_history.append((now, self.x, self.y))
         cutoff = now - 2.5
         while self._pos_history and self._pos_history[0][0] < cutoff:
@@ -700,7 +525,7 @@ class LowSpeedNavigator(Node):
                     self._stuck_since = now
             else:
                 self._stuck_since = None
-        if not self.planned_route and self._stuck_since is not None and now - self._stuck_since > 2.0:
+        if self._stuck_since is not None and now - self._stuck_since > 2.0:
             if self._stuck_backup_until is None:
                 self._stuck_backup_until = now + self.backup_seconds
                 self.get_logger().warning(
@@ -718,10 +543,8 @@ class LowSpeedNavigator(Node):
         # 绕障推进：目标方向被近距离障碍堵住时，转向最空旷且贴近目标的
         # 方向前进；front_blocked 分支已处理正面急障，这里覆盖侧向拥堵。
         target_clear = self._sector_min_dist(heading_error, math.radians(18))
-        # A* 预规划段已经通过机器人膨胀障碍验证，严格沿当前航点
-        # 方向推进；只有 front_blocked 分支才进入紧急绕障。
         steer = heading_error
-        if not self.planned_route and (target_clear is None or target_clear < self.avoid_clearance + 0.1):
+        if target_clear is None or target_clear < self.avoid_clearance + 0.1:
             steer = self._safe_heading(heading_error)
         alignment = max(0.0, math.cos(steer))
         command.linear.x = min(self.max_speed, self.drive_speed_gain * distance * alignment)
@@ -780,8 +603,6 @@ def main() -> int:
                         help="避障方向选择要求的最短可通行距离(m)")
     parser.add_argument("--backup-speed", type=float, default=0.15)
     parser.add_argument("--backup-seconds", type=float, default=2.0)
-    parser.add_argument("--planned-route", action="store_true",
-                        help="预规划配送航点：沿航点直达，仅保留正面紧急避障")
     parser.add_argument("--goal-tolerance", type=float, default=0.10)
     parser.add_argument("--yaw-tolerance", type=float, default=0.10)
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -792,26 +613,13 @@ def main() -> int:
         help="目标货架最后接近段：忽略 LaserScan 主动绕障、雷达超时停车和停滞倒车；仅用于已知安全取货接近路线",
     )
     parser.add_argument(
-        "--pickup-safe-distance", type=float, default=0.30,
+        "--pickup-safe-distance", type=float, default=0.25,
         help="pickup-approach 到达货架外安全边界的距离阈值(m)",
-    )
-    parser.add_argument(
-        "--pickup-lateral-tolerance", type=float, default=0.08,
-        help="pickup-approach 允许的横向误差阈值(m)",
-    )
-    parser.add_argument(
-        "--pickup-exact", action="store_true",
-        help="pickup-approach 严格按 goal-tolerance 到位，不使用货架安全距离放宽",
     )
     parser.add_argument(
         "--pickup-transit",
         action="store_true",
         help="首段起点到 E 货架过渡点：固定直行，不启用配送阶段避障、雷达超时停车或停滞倒车",
-    )
-    parser.add_argument(
-        "--ignore-obstacles",
-        action="store_true",
-        help="无障碍开发单跑：关闭雷达避障/超时停车/脱困，但保留普通目标跟踪",
     )
     parser.add_argument(
         "--route",
@@ -839,16 +647,12 @@ def main() -> int:
         goal_topic=args.goal_topic or None,
         route=route,
         pickup_approach=args.pickup_approach,
-        pickup_exact=args.pickup_exact,
         pickup_transit=args.pickup_transit,
-        ignore_obstacles=args.ignore_obstacles,
         pickup_safe_distance=args.pickup_safe_distance,
-        pickup_lateral_tolerance=args.pickup_lateral_tolerance,
         drive_speed_gain=args.speed_gain,
         avoid_clearance=args.avoid_clearance,
         backup_speed=args.backup_speed,
         backup_seconds=args.backup_seconds,
-        planned_route=args.planned_route,
     )
     try:
         while rclpy.ok() and not node.finished:

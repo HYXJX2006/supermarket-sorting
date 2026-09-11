@@ -20,6 +20,8 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import JointState
+from nav_msgs.msg import Odometry
+from std_msgs.msg import String
 
 JOINT_NAMES = [
     "slide_joint", "head_yaw_joint", "head_pitch_joint",
@@ -29,6 +31,17 @@ JOINT_NAMES = [
     "right_arm_joint2", "right_arm_joint3", "right_arm_joint4",
     "right_arm_joint5", "right_arm_joint6", "right_arm_eef_gripper_joint",
 ]
+STATUS_TOPICS = {
+    "grasp_plan": "/competition/grasp_plan",
+    "deploy_plan": "/competition/deploy_plan",
+    "creep_status": "/competition/creep_status",
+    "close_gripper_status": "/competition/close_gripper_status",
+    "lift_status": "/competition/lift_status",
+    "retreat_status": "/competition/retreat_status",
+    "place_status": "/competition/place_status",
+    "delivery_status": "/competition/delivery_global_status",
+}
+
 SAFE_POSE = {
     "slide_joint": 0.11,
     "head_yaw_joint": 0.0,
@@ -72,11 +85,44 @@ class GraspEvaluator(Node):
         self.started = time.monotonic()
         self.last_message = 0.0
         self.samples: list[dict] = []
+        self.stage_status: dict[str, dict] = {}
+        self.stage_history: list[dict] = []
+        self.base_xy: tuple[float, float] | None = None
+        self.base_yaw: float | None = None
+        self.deploy_target_world: list[float] | None = None
         self.kdl = _load_kdl()
         self.create_subscription(JointState, "/joint_states", self._on_joint_state, qos_profile_sensor_data)
+        self.create_subscription(Odometry, "/slamware_ros_sdk_server_node/odom", self._on_odom, qos_profile_sensor_data)
+        for topic in STATUS_TOPICS.values():
+            self.create_subscription(String, topic, self._on_status, 10)
         self.get_logger().info(f"只读抓取评估启动：stage={stage} duration={self.duration:.1f}s output={output}")
         if self.kdl is None:
             self.get_logger().warning("MMK2Kdl 不可用：将只记录关节反馈，FK 字段为 null")
+
+    def _on_odom(self, msg: Odometry) -> None:
+        pose = msg.pose.pose
+        self.base_xy = (float(pose.position.x), float(pose.position.y))
+        q = pose.orientation
+        self.base_yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+
+    def _on_status(self, msg: String) -> None:
+        topic = getattr(msg, "_topic_name", "")
+        # rclpy messages do not expose their topic; identify by payload action/state.
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, json.JSONDecodeError):
+            return
+        key = str(payload.get("action") or payload.get("stage") or payload.get("controller_state") or payload.get("state") or "unknown")
+        if "deploy_world" in payload and isinstance(payload["deploy_world"], list):
+            self.deploy_target_world = [float(v) for v in payload["deploy_world"]]
+        event = {"elapsed_s": round(time.monotonic() - self.started, 4), "key": key, "payload": payload}
+        self.stage_status[key] = payload
+        self.stage_history.append(event)
+        if len(self.stage_history) > 200:
+            self.stage_history.pop(0)
 
     def _on_joint_state(self, msg: JointState) -> None:
         now = time.monotonic()
@@ -126,10 +172,25 @@ class GraspEvaluator(Node):
             right_q = np.array([slide] + [positions[f"right_arm_joint{i}"] for i in range(1, 7)], dtype=float)
             left, _ = self.kdl.forward_kinematics(left_q, index="left")
             _, right = self.kdl.forward_kinematics(right_q, index="right")
-            return {
+            right_position = [round(float(x), 6) for x in right[:3, 3]]
+            result = {
                 "left_position": [round(float(x), 6) for x in left[:3, 3]],
-                "right_position": [round(float(x), 6) for x in right[:3, 3]],
+                "right_position": right_position,
             }
+            if self.base_xy is not None and self.base_yaw is not None:
+                c, s = math.cos(self.base_yaw), math.sin(self.base_yaw)
+                world = [
+                    self.base_xy[0] + c * right_position[0] - s * right_position[1],
+                    self.base_xy[1] + s * right_position[0] + c * right_position[1],
+                    right_position[2],
+                ]
+                result["right_world_position"] = [round(float(v), 6) for v in world]
+                if self.deploy_target_world is not None:
+                    result["deploy_target_world"] = [round(float(v), 6) for v in self.deploy_target_world]
+                    result["deploy_position_error_m"] = round(
+                        float(np.linalg.norm(np.asarray(world) - np.asarray(self.deploy_target_world))), 6
+                    )
+            return result
         except Exception as exc:
             return {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -163,6 +224,8 @@ class GraspEvaluator(Node):
             "left_arm_max_error_rad": {"latest": latest.get("left_arm_max_error_rad") if latest else None, "mean": round(mean(left), 6) if left else None, "peak": round(max(left), 6) if left else None},
             "right_arm_max_error_rad": {"latest": latest.get("right_arm_max_error_rad") if latest else None, "mean": round(mean(right), 6) if right else None, "peak": round(max(right), 6) if right else None},
             "latest": latest,
+            "stage_status": self.stage_status,
+            "stage_history": self.stage_history,
             "samples": self.samples,
         }
 

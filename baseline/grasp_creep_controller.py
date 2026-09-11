@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -45,7 +46,33 @@ STATUS_TOPIC = "/competition/creep_status"
 
 CREEP_SPEED = 0.12
 MAX_ANGULAR = 0.35
+# 仅用于最终位置比较，吸收仿真浮点/消息离散误差；不改变实际停车线。
+CREEP_Y_COMPARISON_EPSILON = 0.001
 MIN_FRONT_CLEARANCE = 0.28
+# In pickup-approach mode the shelf itself may stop the base before the
+# nominal world-y stop line. Treat that as a valid physical stop only when
+# the remaining end-effector distance is small and x/z alignment is checked.
+PICKUP_PHYSICAL_STOP_FRONT = float(
+    os.environ.get("SUPERMARKET_PICKUP_PHYSICAL_STOP_FRONT", "0.40")
+)
+PICKUP_PHYSICAL_STOP_MAX_REMAINING = float(
+    os.environ.get("SUPERMARKET_PICKUP_PHYSICAL_STOP_MAX_REMAINING", "0.10")
+)
+PICKUP_PHYSICAL_STOP_Y_TOLERANCE = float(
+    os.environ.get("SUPERMARKET_PICKUP_PHYSICAL_STOP_Y_TOLERANCE", "0.22")
+)
+
+
+def pickup_physical_stop_ready(
+    *, pickup_approach: bool, front_min: float | None, remaining_distance: float
+) -> bool:
+    """Return whether the shelf's physical front edge can end creep safely."""
+    return (
+        pickup_approach
+        and front_min is not None
+        and front_min <= PICKUP_PHYSICAL_STOP_FRONT
+        and 0.0 < remaining_distance <= PICKUP_PHYSICAL_STOP_MAX_REMAINING
+    )
 
 
 def wrap_to_pi(value: float) -> float:
@@ -60,13 +87,22 @@ def yaw_from_quaternion(q) -> float:
 
 
 class CreepController(Node):
-    def __init__(self, execute: bool, confirm: str, timeout: float, speed: float, pickup_approach: bool = False) -> None:
+    def __init__(
+        self,
+        execute: bool,
+        confirm: str,
+        timeout: float,
+        speed: float,
+        pickup_approach: bool = False,
+        object_stop_only: bool = False,
+    ) -> None:
         super().__init__("grasp_creep_controller")
         self.execute_enabled = execute and confirm == "creep"
         self.rejected = execute and confirm != "creep"
         self.timeout = max(1.0, float(timeout))
         self.speed = max(0.01, min(0.3, float(speed)))
         self.pickup_approach = bool(pickup_approach)
+        self.object_stop_only = bool(object_stop_only)
         self.started_at = time.monotonic()
         self.last_log = 0.0
         self.done = False
@@ -99,7 +135,8 @@ class CreepController(Node):
         self.create_timer(0.05, self._tick)
         self.get_logger().warning(
             f"CREEP 控制器 mode={'EXECUTE' if self.execute_enabled else 'PLAN-ONLY'} "
-            f"pickup_approach={'on' if self.pickup_approach else 'off'}；"
+            f"pickup_approach={'on' if self.pickup_approach else 'off'} "
+            f"object_stop_only={'on' if self.object_stop_only else 'off'}；"
             "只控制底盘低速接近，不控制机械臂和夹爪"
         )
 
@@ -197,6 +234,7 @@ class CreepController(Node):
                 "object_center_world": self.object_center_world,
                 "creep_target_world": self.creep_target_world,
                 "ee_world": self.ee_world,
+                "grasp_geometry": self.geometry.to_dict(),
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -247,22 +285,72 @@ class CreepController(Node):
         # 官方动作骨架以已伸出的右臂末端 ee 为 creep 参考，
         # 不能让底盘本体追到商品的世界 y 坐标。
         distance = self.stop_y - self.ee_world[1]
-        if distance <= self.geometry.creep_position_tolerance[1]:
+        physical_front_stop = (
+            False
+            if self.object_stop_only
+            else pickup_physical_stop_ready(
+                pickup_approach=self.pickup_approach,
+                front_min=self.front_min,
+                remaining_distance=distance,
+            )
+        )
+        if distance <= self.geometry.creep_position_tolerance[1] or physical_front_stop:
+            # 到达 y 停止线时先完成底盘朝向对齐。若此时直接检查
+            # 末端 x/z，底盘的残余偏航会被误判为抓取横向偏差。
+            heading_error = wrap_to_pi(math.pi / 2.0 - self.yaw)
+            if abs(heading_error) > 0.06:
+                if not self.execute_enabled:
+                    self.cmd_pub.publish(Twist())
+                    self._periodic_log(
+                        f"PLAN-ONLY creep：已到 y 停止线，等待朝向对齐 err={heading_error:.3f}"
+                    )
+                    return
+                command = Twist()
+                command.angular.z = max(-MAX_ANGULAR, min(MAX_ANGULAR, 2.0 * heading_error))
+                self.cmd_pub.publish(command)
+                self._periodic_log(
+                    f"CREEP 已到 y 停止线，先对齐朝向 err={heading_error:.3f}"
+                )
+                return
             target = self.creep_target_world
             if target is None:
                 self._stop("缺少 creep 三轴目标坐标")
                 return
             errors = tuple(float(target[index] - self.ee_world[index]) for index in range(3))
-            tolerances = self.geometry.creep_position_tolerance
-            if abs(errors[0]) > tolerances[0] or abs(errors[2]) > tolerances[2]:
+            creep_tolerances = self.geometry.creep_position_tolerance
+            # deploy 已经用相同目标姿态做过 FK 验证；creep 不应再
+            # 用更严的 x/z 门限否定同一副已到位的机械臂。
+            y_tolerance = (
+                PICKUP_PHYSICAL_STOP_Y_TOLERANCE
+                if physical_front_stop
+                else creep_tolerances[1]
+            )
+            tolerances = (
+                # 仿真底盘/末端反馈存在毫米级离散误差；保留
+                # deploy 的安全门槛，同时避免 0.066m 这类 1mm 边界值
+                # 把已正确到位的目标误判为失败。
+                max(creep_tolerances[0], self.geometry.deploy_position_tolerance, 0.070),
+                y_tolerance,
+                max(creep_tolerances[2], self.geometry.deploy_position_tolerance),
+            )
+            if (
+                abs(errors[0]) > tolerances[0]
+                or abs(errors[1]) > tolerances[1] + CREEP_Y_COMPARISON_EPSILON
+                or abs(errors[2]) > tolerances[2]
+            ):
                 self._stop(
-                    "到达 y 停止线但末端未对准："
-                    f"error_xyz=({errors[0]:.3f},{errors[1]:.3f},{errors[2]:.3f})m "
-                    f"tol_xyz=({tolerances[0]:.3f},{tolerances[1]:.3f},{tolerances[2]:.3f})m"
+                    ("货架物理前沿停止但末端未对准：" if physical_front_stop else "到达 y 停止线但末端未对准：")
+                    + f"error_xyz=({errors[0]:.3f},{errors[1]:.3f},{errors[2]:.3f})m "
+                    + f"tol_xyz=({tolerances[0]:.3f},{tolerances[1]:.3f},{tolerances[2]:.3f})m"
                 )
                 return
             self._stop(
-                f"已到 creep 三轴停止线 error_xyz=({errors[0]:.3f},{errors[1]:.3f},{errors[2]:.3f})m",
+                (
+                    "已到货架物理前沿停止位"
+                    if physical_front_stop
+                    else "已到 creep 三轴停止线"
+                )
+                + f" error_xyz=({errors[0]:.3f},{errors[1]:.3f},{errors[2]:.3f})m",
                 success=True,
             )
             return
@@ -274,7 +362,9 @@ class CreepController(Node):
             return
 
         command = Twist()
-        command.linear.x = min(self.speed, max(0.0, 0.5 * distance))
+        # 接近停止线时保留一个很小但可克服仿真底盘静摩擦的速度；
+        # 否则速度随距离降到约 0.02m/s 后会停滞，直到 worker 超时。
+        command.linear.x = min(self.speed, max(0.035, 0.5 * distance))
         command.angular.z = max(-MAX_ANGULAR, min(MAX_ANGULAR, 2.0 * wrap_to_pi(math.pi / 2.0 - self.yaw)))
         self.cmd_pub.publish(command)
         front_text = f"{self.front_min:.3f}" if self.front_min is not None else "ignored"
@@ -297,13 +387,22 @@ def main() -> int:
     parser.add_argument("--speed", type=float, default=CREEP_SPEED, help="creep 速度上限（m/s），默认 0.12")
     parser.add_argument("--pickup-approach", action="store_true",
                         help="取货 creep 阶段忽略货架触发的 LaserScan 停车，仅按末端停止线停车")
+    parser.add_argument("--object-stop-only", action="store_true",
+                        help="取货阶段不使用货架前沿提前停车，只按物体停止线停车")
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
     if args.execute and args.confirm != "creep":
         print("拒绝执行：必须使用 --confirm creep")
         return 2
     rclpy.init()
-    node = CreepController(args.execute, args.confirm, args.timeout, args.speed, args.pickup_approach)
+    node = CreepController(
+        args.execute,
+        args.confirm,
+        args.timeout,
+        args.speed,
+        args.pickup_approach,
+        args.object_stop_only,
+    )
     try:
         while rclpy.ok() and not node.done:
             rclpy.spin_once(node, timeout_sec=0.1)
