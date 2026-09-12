@@ -28,7 +28,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profi
 from std_msgs.msg import Float64MultiArray, String
 from vision_msgs.msg import Detection3DArray
 
-from inventory_map import SHELF_ORDER_FOR_ROUTE, SLOT_X, InventoryEntry, InventoryMap
+from inventory_map import LEVEL_Z, SHELF_ORDER_FOR_ROUTE, SLOT_X, InventoryEntry, InventoryMap
 
 TASK_TOPIC = "/supermarket_sorting/task"
 DETECTION_TOPIC = "/multiclass/detections"
@@ -139,6 +139,12 @@ DETECTION_Y_BIAS = _env_float("SUPERMARKET_DETECTION_Y_BIAS", 0.0)
 # E/L1/C1 conf=0.94 的真候选没被用上。改为：候选池只收 conf>= 门槛的条目，
 # 门槛之下仍留在地图里（供复核参考），但不作为抓取目标。
 MIN_CANDIDATE_CONFIDENCE = _env_float("SUPERMARKET_MIN_CANDIDATE_CONFIDENCE", 0.50)
+# 抓取高度按货位层高约束：层高是已知的固定布局真值（LEVEL_Z = 0.56/0.91/1.24），
+# 而视觉 z 在 L2/L3 系统性偏高——2026-09-12 实测地图检出 L2 0.92~1.00、L3 1.19~1.27
+# （真值 0.90/1.24，偏 +3~+10cm）。L1 因为位置低、容错大所以能抓成；L2 目标 z 被
+# 抬到 1.002 → 部署 EE 高度比罐身上沿还高 4cm → 闭爪 4 次全落空（feedback 0.08~0.10）。
+# 这里把层高当硬约束，视觉 z 只允许在 ±Z_LEVEL_CLAMP_M 内做微调。
+Z_LEVEL_CLAMP_M = _env_float("SUPERMARKET_Z_LEVEL_CLAMP_M", 0.025)
 # 跳巡游扫描：比赛时限 420s，而 E→D→C→B→A 全扫描实测要 5-8 分钟。
 # 任务清单（目标 kind）与 45 槽位布局都是已知的，可直接用布局真值预填地图
 # 并立即进入执行阶段，把扫描时间全部省掉。
@@ -1875,7 +1881,18 @@ class InventoryCompetitionExecutor(Node):
                 f"[exec] 近距复核：{kind} 近距检测与扫描坐标一致（{len(samples)} 样本），不修正"
             )
             return
-        cand.world = refined
+        clamped = refined
+        level_z = LEVEL_Z.get(int(getattr(cand, "level", 0) or 0))
+        if Z_LEVEL_CLAMP_M > 0.0 and level_z is not None:
+            lo, hi = level_z - Z_LEVEL_CLAMP_M, level_z + Z_LEVEL_CLAMP_M
+            if refined[2] < lo or refined[2] > hi:
+                clamped = (refined[0], refined[1], min(hi, max(lo, refined[2])))
+                self.get_logger().warning(
+                    f"[exec] 近距复核：{kind} 高度 z={refined[2]:.3f} 超出货位 "
+                    f"{cand.slot} 层高 {level_z:.2f}±{Z_LEVEL_CLAMP_M:.3f}，"
+                    f"夹到 {clamped[2]:.3f}"
+                )
+        cand.world = clamped
         self.get_logger().info(
             f"[exec] 近距复核：{kind} 目标 "
             f"({old[0]:.3f},{old[1]:.3f},{old[2]:.3f}) → "
