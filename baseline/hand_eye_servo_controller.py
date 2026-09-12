@@ -275,8 +275,10 @@ class HandEyeServo(Node):
             except Exception:
                 sens = 0.0
             # 修正方向/幅度用实测标定：dj3=+0.15 时误差 +6cm（数值 FK 预言
-            # +x 方向与实际相反）→ 经验灵敏度 -0.4 m/rad，dj3 = -err/0.4
-            dj3 = max(-0.15, min(0.15, -err_lateral / 0.4))
+            # +x 方向与实际相反）→ 经验灵敏度 -0.4 m/rad。
+            # 阻尼 0.5：全额修正在罐子两侧 ±6cm 振荡不收敛（实测 +3.7/+6.0/-6.0），
+            # 半量迭代 2-3 次收敛到 ±1cm。
+            dj3 = max(-0.08, min(0.08, -err_lateral / 0.4 * 0.5))
             sens = -0.4
             if abs(dj3) < 1e-3:
                 continue
@@ -332,7 +334,7 @@ def main() -> int:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm", default="")
     parser.add_argument("--timeout", type=float, default=40.0)
-    parser.add_argument("--max-iterations", type=int, default=1)
+    parser.add_argument("--max-iterations", type=int, default=3)
     parser.add_argument("--lateral-tol-m", type=float, default=0.012)
     parser.add_argument("--u-sign", type=float,
                         default=float(os.getenv("SUPERMARKET_SERVO_U_SIGN", "-1.0")),

@@ -72,9 +72,14 @@ X11_DISPLAY="${X11_DISPLAY:-172.25.192.1:1}"
 SERVER_NAME="random5_autopilot_server"
 CLIENT_NAME="random5_autopilot_client"
 
-# 检测权重：默认固定使用已验证的 v4；v5 已弃用，不能按修改时间
-# 自动选中。仍可通过 MULTICLASS_WEIGHTS 显式覆盖。
+# 检测权重：默认使用 v6（v4 + 手眼伺服时代的混淆专项微调，修复
+# chengzi/kouxiangtang/maidong 分类混淆）；v4 为回退。仍可通过
+# MULTICLASS_WEIGHTS 显式覆盖。
 if [[ -z "${MULTICLASS_WEIGHTS:-}" ]]; then
+  PREFERRED_V6="$ROOT/baseline/debug_data/multiclass_train_v6_servo/confusion_finetune/weights/best.pt"
+  if [[ -f "$PREFERRED_V6" ]]; then
+    MULTICLASS_WEIGHTS="$PREFERRED_V6"
+  else
   PREFERRED_V4="$ROOT/baseline/debug_data/multiclass_train_formal_v4/multiclass_random_finetune/weights/best.pt"
   if [[ -f "$PREFERRED_V4" ]]; then
     MULTICLASS_WEIGHTS="$PREFERRED_V4"
@@ -88,6 +93,7 @@ if [[ -z "${MULTICLASS_WEIGHTS:-}" ]]; then
     else
       MULTICLASS_WEIGHTS="/workspace/baseline/debug_data/multiclass_train_smoke/multiclass_smoke/weights/best.pt"
     fi
+  fi
   fi
 fi
 # 挂载路径默认指向容器内 /workspace/baseline（MULTICLASS_WEIGHTS 若含该前缀则直接使用）
@@ -214,7 +220,7 @@ if [[ \$READY -ne 1 ]]; then
 fi
 python3 -u /workspace/baseline/inventory_competition_executor.py \
     --execute --confirm random5${STOP_AFTER_IK_ARG}${STOP_AFTER_CLOSE_ARG} \
-    --map-timeout ${MAP_TIMEOUT:-120} \
+    --map-timeout ${MAP_TIMEOUT:-240} \
     --mapping-max-speed $MAPPING_SPEED \
     --cruise-max-speed $CRUISE \
     --obstacle-distance $OBSTACLE_DIST \

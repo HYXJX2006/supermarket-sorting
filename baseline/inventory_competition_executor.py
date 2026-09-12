@@ -73,7 +73,11 @@ ARM_ODOM_STABLE_SAMPLES = max(3, _env_int("SUPERMARKET_ARM_ODOM_STABLE_SAMPLES",
 ARM_ODOM_STABLE_POS_TOL = _env_float("SUPERMARKET_ARM_ODOM_STABLE_POS_TOL", 0.015)
 ARM_ODOM_STABLE_YAW_TOL = _env_float("SUPERMARKET_ARM_ODOM_STABLE_YAW_TOL", 0.05)
 PLAN_GATE_TIMEOUT = max(10.0, _env_float("SUPERMARKET_PLAN_GATE_TIMEOUT", 60.0))
-TARGET_APPROACH_OFFSET_X = 0.12  # 目标列右侧安全余量，降低边列 IK 横向偏差
+# 目标列右侧安全余量，降低边列 IK 横向偏差。
+# 0.156 = 0.12 + 0.036：2026-09-12 手眼伺服 11 轮实测，抓取点系统性偏
+# 目标左侧 3.6cm（±0.6cm 波动）——右臂横跨身体抓取的固有偏差，在底盘
+# 停靠位补偿（伺服 j3 修它会推到工作空间边界，deploy 关节卡死）。
+TARGET_APPROACH_OFFSET_X = _env_float("SUPERMARKET_TARGET_APPROACH_OFFSET_X", 0.156)
 # 用户指定的实际扫描顺序：E(最右) → D → C → B；A 仅在目标缺失时补扫。
 # 不按字母排序，也不在 BCDE 扫描后临时追加 A；一轮固定建立 45 货位地图。
 MAPPING_SHELVES = ("E", "D", "C", "B")
@@ -1742,6 +1746,32 @@ class InventoryCompetitionExecutor(Node):
                     continue
                 samples.append((world, conf))
         if len(samples) < REFINE_MIN_SAMPLES:
+            # 类别错配守卫：目标位置没有本类检测、却有其他类的近距观测
+            # → YOLO 把别的商品误分类成目标（实测脉动瓶被认成橙子），
+            # 盲抓必失败，提前报错换下一候选
+            other_kind = None
+            other_dist = 1e9
+            for o_kind, o_tracks in self.tracks.items():
+                if o_kind == kind:
+                    continue
+                for o_track in o_tracks:
+                    for ts, o_world, _ in o_track.samples:
+                        if now - ts > REFINE_WINDOW_S:
+                            continue
+                        d = math.dist(o_world, old)
+                        if d < other_dist:
+                            other_kind, other_dist = o_kind, d
+                        break
+            if other_kind is not None and other_dist < 0.20:
+                self.get_logger().warning(
+                    f"[exec] 近距复核：{kind} 在目标位置无检测，但 {other_kind} 有"
+                    f"（{other_dist * 100:.0f}cm）——疑似 YOLO 误分类，放弃该候选"
+                )
+                cand.world = (old[0], old[1] + DETECTION_Y_BIAS, old[2])
+                self._fail_current(
+                    f"近距复核类别错配：目标 {kind} 位置检测到 {other_kind}"
+                )
+                return
             self.get_logger().warning(
                 f"[exec] 近距复核：{kind} 近 {REFINE_WINDOW_S:.1f}s 内仅 "
                 f"{len(samples)}/{REFINE_MIN_SAMPLES} 个有效检测，"
@@ -1756,6 +1786,15 @@ class InventoryCompetitionExecutor(Node):
         # y 系统偏差补偿：检测深度系统性偏近（见 DETECTION_Y_BIAS 注释）
         refined = (refined[0], refined[1] + DETECTION_Y_BIAS, refined[2])
         drift = math.dist(refined, old)
+        if drift > 0.15:
+            # 修正幅度过大 = 大概率追错了目标（弱聚类/误检的近距确认），
+            # 弃用本次修正保留原坐标——26cm 级的"修正"曾把目标拉到
+            # 错误货架导致 IK 不可达（实测）
+            self.get_logger().warning(
+                f"[exec] 近距复核：{kind} 修正 {drift * 100:.0f}cm 超过 15cm 上限，"
+                f"疑似追错目标，弃用（{len(samples)} 样本）"
+            )
+            return
         if drift <= 0.005:
             self.get_logger().info(
                 f"[exec] 近距复核：{kind} 近距检测与扫描坐标一致（{len(samples)} 样本），不修正"

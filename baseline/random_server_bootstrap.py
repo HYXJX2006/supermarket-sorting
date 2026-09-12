@@ -70,10 +70,26 @@ def choose_targets() -> list[dict[str, str]]:
             if item.strip()
         ]
         by_body = {item["body"]: item for item in products}
-        unknown = [body for body in bodies if body not in by_body]
+        # 品类名支持：SUPERMARKET_TASKS 也可用 object_kind（该类随机取一罐）
+        by_kind: dict[str, list[dict[str, str]]] = {}
+        for item in products:
+            by_kind.setdefault(item["kind"], []).append(item)
+        selection_seed = int_env(
+            "SUPERMARKET_TASK_SELECTION_SEED",
+            int_env("SUPERMARKET_SEED", 11),
+        )
+        rng = random.Random(selection_seed)
+        unknown = []
+        selected = []
+        for token in bodies:
+            if token in by_body:
+                selected.append(by_body[token])
+            elif token in by_kind:
+                selected.append(rng.choice(by_kind[token]))
+            else:
+                unknown.append(token)
         if unknown:
             raise ValueError("unknown SUPERMARKET_TASKS: " + ", ".join(unknown))
-        selected = [by_body[body] for body in dict.fromkeys(bodies)]
     else:
         count = int_env("SUPERMARKET_TASK_COUNT", 5)
         if not 1 <= count <= len(products):
