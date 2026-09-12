@@ -132,6 +132,13 @@ REFINE_MAX_RADIUS = _env_float("SUPERMARKET_REFINE_MAX_RADIUS", 0.40)
 # 双向波动，是随机噪声而非系统差），固定补偿会双向过头。近距复核的中位数
 # （REFINE_*）才是有效校正。保留环境变量供后续实测再开。
 DETECTION_Y_BIAS = _env_float("SUPERMARKET_DETECTION_Y_BIAS", 0.0)
+# 候选置信度门槛：地图允许低分检测"靠 12 帧空间稳定"转正，但**预订候选**
+# 必须够可信。2026-09-12 实测：D/L2/C2 被一条 conf=0.15（正好等于检测器下限）
+# 的 sanmingzhi 弱检写进地图并因路线最短被预订，机器开到该槽位近距复核发现
+# 是 heweidao(0.963) → 类别错配守卫否决 → 整轮 0 分；而同轮地图里另有
+# E/L1/C1 conf=0.94 的真候选没被用上。改为：候选池只收 conf>= 门槛的条目，
+# 门槛之下仍留在地图里（供复核参考），但不作为抓取目标。
+MIN_CANDIDATE_CONFIDENCE = _env_float("SUPERMARKET_MIN_CANDIDATE_CONFIDENCE", 0.50)
 # 跳巡游扫描：比赛时限 420s，而 E→D→C→B→A 全扫描实测要 5-8 分钟。
 # 任务清单（目标 kind）与 45 槽位布局都是已知的，可直接用布局真值预填地图
 # 并立即进入执行阶段，把扫描时间全部省掉。
@@ -284,6 +291,9 @@ class InventoryCompetitionExecutor(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self._servo_standoff = 0.0
         self.consecutive_failures = 0
+        # 近距复核否决过的槽位（本轮内不再作为候选）：地图 entry 的 kind
+        # 可能被后续检测流覆盖回去，所以否决记录必须单独存一份。
+        self.rejected_slots: set[str] = set()
         self.recovering_from_failure = False
         self.nav_retry = 0
         self.tilt_deg = 0.0
@@ -593,9 +603,26 @@ class InventoryCompetitionExecutor(Node):
                 entry
                 for entry in self.map.candidates(kind)
                 if entry.shelf in allowed_shelves
+                and float(entry.confidence) >= MIN_CANDIDATE_CONFIDENCE
             ]
             for kind in {t.kind for t in self.targets}
         }
+        # 弱检测只写日志不预订：否则"路线最短"会把 0.15 的误检排到真候选前面。
+        weak_kinds = [
+            kind
+            for kind in {t.kind for t in self.targets}
+            if not available.get(kind)
+            and any(
+                float(e.confidence) < MIN_CANDIDATE_CONFIDENCE
+                for e in self.map.candidates(kind)
+            )
+        ]
+        if weak_kinds:
+            self.get_logger().warning(
+                f"[exec] 候选置信度不足（<{MIN_CANDIDATE_CONFIDENCE:.2f}）被排除："
+                + ",".join(sorted(weak_kinds))
+                + "；这些槽位仍留在地图里供复核参考"
+            )
         reserved_slots: set[str] = set()
         for target in self.targets:
             candidates = [
@@ -1630,6 +1657,14 @@ class InventoryCompetitionExecutor(Node):
         current_y = float(self.y) if self.y is not None else OBSERVE_Y
         side_yaw = 0.0 if goal_x >= current_x else math.pi
         pregrasp_y = ARM_PREGRASP_Y + PREGRASP_GOAL_TOLERANCE
+        # 已在预抓取线容差内时，目标点必须落在导航的 goal_tolerance(0.05)
+        # 内，否则会发出"只前进 3cm"的 pickup-approach 目标：偏航门限+惯性
+        # 会让 remaining_along 变成负数，触发 _pickup_reverse_latched，
+        # 之后 heading_err 在 ±0.35 附近来回穿越、一直原地打转直到 240s
+        # 超时（2026-09-12 实测：C/L2/C3 目标在这里耗掉 ~100s 仿真时间，
+        # 重试后又是同样结局）。贴线时把目标点钉在当前 y 上（只走回正）。
+        if abs(current_y - pregrasp_y) <= PREGRASP_GOAL_TOLERANCE:
+            pregrasp_y = current_y
         dx = current_x - goal_x
         dy = current_y - pregrasp_y
         goals: list[tuple[float, float, float, bool, float, bool]] = []
@@ -1766,14 +1801,51 @@ class InventoryCompetitionExecutor(Node):
                             other_kind, other_dist = o_kind, d
                         break
             if other_kind is not None and other_dist < 0.20:
+                # 先换候选，别急着判死：该槽位近距看到的是别的类，说明
+                # 地图把这个槽位记错了（实测 D/L2/C2 被 conf=0.15 的弱检
+                # 写成 sanmingzhi，近距实为 heweidao 0.963）。整轮只有 420s，
+                # 一个候选判死就结束整轮是不可接受的；这里拉黑该槽位、
+                # 保留本目标，回头换同 kind 的下一个候选继续。
+                slot = str(cand.slot)
+                self.rejected_slots.add(slot)
+                self.map.mark(slot, "invalid", target.target_id)
+                blocked = target.candidate is not None and str(target.candidate.slot) == slot
+                if blocked or len(self.rejected_slots) >= REJECTED_CANDIDATE_LIMIT:
+                    # 备选已用尽（或没有可换的候选）：按原逻辑判失败并推进。
+                    self.get_logger().error(
+                        f"[exec] 近距复核类别错配且无备选（已否决 "
+                        f"{len(self.rejected_slots)} 个槽位）："
+                        f"目标 {kind} 位置检测到 {other_kind}"
+                    )
+                    cand.world = (old[0], old[1] + DETECTION_Y_BIAS, old[2])
+                    self._fail_current(
+                        f"近距复核类别错配：目标 {kind} 位置检测到 {other_kind}"
+                    )
+                    return
                 self.get_logger().warning(
-                    f"[exec] 近距复核：{kind} 在目标位置无检测，但 {other_kind} 有"
-                    f"（{other_dist * 100:.0f}cm）——疑似 YOLO 误分类，放弃该候选"
+                    f"[exec] 近距复核：槽位 {slot} 近距看到 {other_kind}"
+                    f"（{other_dist * 100:.0f}cm）而非 {kind}，拉黑该候选，"
+                    f"换下一个候选继续（已否决 {len(self.rejected_slots)}/"
+                    f"{REJECTED_CANDIDATE_LIMIT}）"
                 )
-                cand.world = (old[0], old[1] + DETECTION_Y_BIAS, old[2])
-                self._fail_current(
-                    f"近距复核类别错配：目标 {kind} 位置检测到 {other_kind}"
-                )
+                self._save_map()
+                self._publish_targets("candidate_rejected")
+                self._reset_navigation_state(reason=f"槽位 {slot} 近距类别错配，换候选")
+                if target.candidate is not None:
+                    target.candidate = None
+                target.reserved = False
+                target.status = "searching"
+                # 重新预订候选：_target_order 会跳过 rejected_slots 和
+                # state=invalid 的槽位，从同 kind 的剩余候选里按路线重新挑。
+                self._target_order()
+                self._save_map()
+                if target.candidate is None:
+                    self.get_logger().error(
+                        f"[exec] 近距复核否决槽位 {slot} 后已无可用同类候选"
+                    )
+                    self._fail_current("近距复核类别错配且同类候选耗尽")
+                    return
+                self._start_current_target()
                 return
             self.get_logger().warning(
                 f"[exec] 近距复核：{kind} 近 {REFINE_WINDOW_S:.1f}s 内仅 "
