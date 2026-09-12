@@ -90,11 +90,19 @@ def _remove_named_body(xml_text: str, body_name: str) -> str:
 def apply_camera_performance_overrides(cfg: Any) -> Any:
     """Optionally render only the head camera for the competition detector."""
     if _truthy(os.getenv("SUPERMARKET_GS_HEAD_ONLY", "1")):
-        # The detector and RGB-D geometry consume the head camera. Avoid
-        # serializing left/right arm-camera GS renders in the physics thread.
-        cfg.obs_rgb_cam_id = [0]
-        cfg.obs_depth_cam_id = [0]
-        print("[server] 3DGS camera mode: head-only", flush=True)
+        # 头相机走 GS（检测/近距复核）；手眼 left/right 保留在发布列表里，
+        # 由 simulator 补丁的 _native_obs_cam_ids 用原生渲染填充——伺服和
+        # 三视角审查需要手眼话题，原生小图开销极低。此前直接裁成 [0]，
+        # 手眼话题整个消失（stream 显示 no signal），手眼伺服无从做起。
+        native_hand_eye = _truthy(os.getenv("SUPERMARKET_HAND_EYE_NATIVE", "1"))
+        if native_hand_eye:
+            cfg.obs_rgb_cam_id = [0, 1, 2]
+            cfg.obs_depth_cam_id = [0, 1, 2]
+            print("[server] 3DGS camera mode: head GS + hand-eye native", flush=True)
+        else:
+            cfg.obs_rgb_cam_id = [0]
+            cfg.obs_depth_cam_id = [0]
+            print("[server] 3DGS camera mode: head-only", flush=True)
     return cfg
 
 

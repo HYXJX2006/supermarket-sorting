@@ -84,7 +84,7 @@ PITCH_SCAN = (
     (float(os.getenv("SUPERMARKET_PITCH_MIDDLE", "-0.45")), "middle"),
     (float(os.getenv("SUPERMARKET_PITCH_LOWER", "-0.70")), "lower"),
 )
-PITCH_DWELL_S = float(os.getenv("SUPERMARKET_PITCH_DWELL_S", "4.0"))
+PITCH_DWELL_S = float(os.getenv("SUPERMARKET_PITCH_DWELL_S", "1.5"))   # 比赛时限 420s
 # 配送站位参数化：桌子(delivery_table)中心 (-1.940,-3.410)，桌面南缘 y=-3.19。
 # 原站位 y=-2.80 时车头离桌沿仅 ~0.09m（实测"离桌子太近"）；外移到 y=-2.55。
 DELIVERY_GOAL = (
@@ -97,26 +97,92 @@ DELIVERY_BASE_Y = (-3.880, -2.620)
 # 检测坐标吸附到最近同类货位的半径：覆盖实测 8cm 误差，同时小于相邻货位
 # 间距（同层 0.22m / 同列 0.33m）的一半，避免吸到隔壁。
 SLOT_SNAP_RADIUS = _env_float("SUPERMARKET_SLOT_SNAP_RADIUS", 0.13)
+# 槽位吸附开关，默认关闭。slot_truth 读的是静态默认布局；随机布局下商品
+# 位置已重排，吸附/就近回退会把正确检测扳到错误位置（2026-09-12 对账：
+# 吸附后地图与真实布局仅 1/34 相符，纯检测聚类 89% 召回/中位 3.5cm 偏差）。
+# 仅固定基线标定（SUPERMARKET_SLOT_SNAP=1）时启用。
+SLOT_SNAP_ENABLED = os.getenv("SUPERMARKET_SLOT_SNAP", "0").strip().lower() in {"1", "true", "yes", "on"}
 # creep 失败后的重对准重试次数（回退 10cm 后重新 deploy→creep）
 CREEP_RETRY_MAX = int(_env_float("SUPERMARKET_CREEP_RETRY_MAX", 2))
 # 单个目标失败后先收臂到安全位再继续下一目标；连续失败到上限才终结整轮。
 # 此前"一个目标失败即停止本轮"让 5 个任务的比赛只跑了 1 个就结束。
 MAX_CONSECUTIVE_FAILURES = int(_env_float("SUPERMARKET_MAX_CONSECUTIVE_FAILURES", 3))
+# arm worker 硬超时兜底：worker 自身超时逻辑可能失效（实测 safe_arm 在等
+# joint_states 时挂了 50 分钟不退出），整个流程就卡死在收尾阶段。
+# 超过该值一律强杀并推进，保证比赛流程能跑完而不是挂住。
+# 各 arm worker 正常耗时都 <50s（safe_pose 5s / deploy 15-25s / creep 8-40s /
+# retreat 3s / slide_reset 1s / place 10s），90s 已很宽裕；此前 240s 让
+# safe_pose 卡死时要白等 4 分钟（比赛时限 420s 里这是致命的）。
+ARM_WORKER_HARD_TIMEOUT = _env_float("SUPERMARKET_ARM_WORKER_HARD_TIMEOUT", 90.0)
+# 配送段导航看门狗：RTF<1 时 5-8m 走 40-60s，加避障绕行余量取 150s。
+DELIVER_NAV_TIMEOUT = _env_float("SUPERMARKET_DELIVER_NAV_TIMEOUT", 150.0)
+# 抓前近距复核：机器人到预抓取线、伸爪之前，用近距离检测更新目标坐标。
+# 远距离扫描的 RGB-D 投影偶发大偏差（2026-09-12 实测单罐 z 偏 29cm、
+# 常态 y/z 偏 2-5cm，足以让指头平面错过罐身）；机器人此刻已贴近货架，
+# 同 kind 的最新检测精度远高于扫描期。仅取旧目标 REFINE_MAX_RADIUS 内
+# 的近距样本，避免修到旁边的同类副本。2026-09-12 提议并实现。
+REFINE_WINDOW_S = _env_float("SUPERMARKET_REFINE_WINDOW_S", 2.5)
+REFINE_MIN_SAMPLES = max(2, int(_env_float("SUPERMARKET_REFINE_MIN_SAMPLES", 4)))
+REFINE_MAX_RADIUS = _env_float("SUPERMARKET_REFINE_MAX_RADIUS", 0.40)
+# 检测 y 偏差补偿：默认 0。实测检测中位数长期看无偏（各轮 -4.4~+2.9cm
+# 双向波动，是随机噪声而非系统差），固定补偿会双向过头。近距复核的中位数
+# （REFINE_*）才是有效校正。保留环境变量供后续实测再开。
+DETECTION_Y_BIAS = _env_float("SUPERMARKET_DETECTION_Y_BIAS", 0.0)
+# 跳巡游扫描：比赛时限 420s，而 E→D→C→B→A 全扫描实测要 5-8 分钟。
+# 任务清单（目标 kind）与 45 槽位布局都是已知的，可直接用布局真值预填地图
+# 并立即进入执行阶段，把扫描时间全部省掉。
+SKIP_SCAN = os.getenv("SUPERMARKET_SKIP_SCAN", "0").strip() == "1"
+# 导航连续失败上限：此前只重启不放弃，车被障碍挡住时会无限"超时→重启"
+# 循环卡死整轮（实测卡 27 分钟）。超过上限即判当前目标失败并交给
+# 失败恢复链路（收臂→跳过→下一目标）。
+NAV_RETRY_MAX = int(_env_float("SUPERMARKET_NAV_RETRY_MAX", 3))
+# 倾角监控：机器人翻倒时 odom 的 roll/pitch 会大幅偏离（实测翻车后
+# 流程还傻跑了十几分钟无人发现）。超过阈值立即停止本轮。
+TILT_ABORT_DEG = _env_float("SUPERMARKET_TILT_ABORT_DEG", 45.0)
+# 载货配送限速：夹持商品 + 机械臂前伸 => 重心前移，空车不翻的速度在这里会翻
+# （实测 deliver 阶段倾角 47.1°）。必须显著低于 cruise_max_speed。
+DELIVERY_SPEED = _env_float("SUPERMARKET_DELIVERY_SPEED", 0.80)
+# 角速度上限：0.45 rad/s 时一次 180° 掉头要 7 秒，是流程里最贵的纯浪费动作。
+# 翻车根因是"线速度+加减速惯性"（09-11 实测），不是角速度；原地转向时线速度
+# 为零、且掉头发生在 slide_reset 之后（升降柱已降），重心低，可安全放宽。
+# 载货段仍取保守值（夹持商品是翻车敏感场景）。
+NAV_MAX_ANGULAR = _env_float("SUPERMARKET_NAV_MAX_ANGULAR", 0.90)
+DELIVERY_MAX_ANGULAR = _env_float("SUPERMARKET_DELIVERY_MAX_ANGULAR", 0.60)
 NAV_GOAL_TOPIC_EXEC = NAV_GOAL_TOPIC
 DEFAULT_MAPPING_SPEED = 0.35   # 货架前巡游扫描安全低速
 DEFAULT_CRUISE_SPEED = 1.2     # 长直 clear 段（去配送/返程）巡航速度
 DEFAULT_OBSTACLE = 0.5
 PREGRASP_GOAL_TOLERANCE = 0.05
-PREGRASP_ODOM_YAW_TOLERANCE = 0.10
+# 0.10 rad（5.7°）在臂前伸 0.8m 处 = ~8cm 横向偏差（实测 creep x 超差、
+# 苹果偏到夹爪一侧的根因之一）。收紧到 0.06（≈3.4° → ~4.8cm），
+# 仍留有余量避免门禁频繁重试。
+PREGRASP_ODOM_YAW_TOLERANCE = 0.06
 PREGRASP_ODOM_GATE_MAX_RETRIES = 3
 # 低置信度检测先进入跟踪，只有更长时间的空间稳定后才写入库存地图。
 TRACK_STABILITY_WINDOW = max(6, _env_int("SUPERMARKET_TRACK_STABILITY_WINDOW", 8))
 
 # 动作 worker 表：脚本 + 固定参数（参照 single_item_executor.WORKER_SCRIPTS 的 spawn 约定）。
 # 这些 worker 只控制机械臂/夹爪/升降柱，不控底盘；底盘由本 executor 独占。
-ARM_ACTIONS = ("safe_pose", "deploy", "creep", "close_gripper", "lift", "retreat", "slide_reset")
+# servo：creep 到位后、闭爪前的手眼伺服——测"手指-商品"横向/高度偏差，
+# 超阈值则回退重部署（复用 creep-retry 的 backoff→deploy→creep 通道）。
+ARM_ACTIONS = ("safe_pose", "deploy", "creep", "servo", "close_gripper", "lift", "retreat", "slide_reset")
 POST_PLACE_SAFE_POSE = "post_place_safe_pose"
+# 手眼伺服：偏差超过 SERVO_APPLY_THRESHOLD 则带修正量回退重部署；
+# 最多 SERVO_RETRY_MAX 次（每次部署 ~20s，比赛时限内可承受）。
+SERVO_RESULT_PATH = "debug_data/servo_result.json"
+# 8mm 低于伺服的团块质心噪声底（±1-2cm），会永远触发重部署；1.5cm
+# 与"6.5cm 罐身可容忍的横向偏差"匹配，小残差直接闭爪。
+SERVO_APPLY_THRESHOLD = _env_float("SUPERMARKET_SERVO_APPLY_THRESHOLD", 0.015)
+SERVO_RETRY_MAX = int(_env_float("SUPERMARKET_SERVO_RETRY_MAX", 2))
 WORKER_CFG = {
+    "servo": ("hand_eye_servo_controller.py", ["--execute", "--confirm", "servo", "--timeout", "40"]),
+    # 伺服重部署序列：先退 30cm 让手完全脱离货架前沿，再抬手退出格子，
+    # 再 deploy。顺序反了会刮层板/顶上层板（在格内先抬手会撞 L3 板）。
+    "backoff_far": ("retreat_controller.py", ["--execute", "--confirm", "retreat", "--distance", "0.30", "--timeout", "60"]),
+    # 伺服重部署序列第二步：把手从货架格子里竖直抽出来。从格内姿态直接
+    # 关节插值重部署会刮蹭层板（max_arm_err 卡 0.23 rad 不收敛 → 硬超时，
+    # 实测三次），先退远+抬手再 deploy 就顺畅了。
+    "slide_up": ("slide_reset_controller.py", ["--execute", "--confirm", "slide_reset", "--target", "0.87", "--timeout", "30"]),
     "safe_pose": ("safe_arm_controller.py", ["safe_pose", "--execute", "--confirm", "safe_pose", "--timeout", "90"]),
     "deploy": ("grasp_deploy_controller.py", ["--execute", "--confirm", "deploy", "--timeout", "180"]),
     "creep": ("grasp_creep_controller.py", ["--execute", "--confirm", "creep", "--pickup-approach", "--object-stop-only", "--timeout", "180"]),
@@ -196,8 +262,16 @@ class InventoryCompetitionExecutor(Node):
         self.map = InventoryMap()
         self.tracks: dict[str, list[Track]] = defaultdict(list)
         self.creep_retry = 0
+        self.servo_retry = 0
+        self.servo_redeploy = False   # 伺服重部署序列：slide_up → backoff → deploy
+        self._servo_depth_extra = 0.0  # 伸入深度修正（只进 creep 停止线）
+        self.depth_probe_count = 0     # 闭爪落空后的深度探测计数
+        self._servo_standoff = 0.0
         self.consecutive_failures = 0
         self.recovering_from_failure = False
+        self.nav_retry = 0
+        self.tilt_deg = 0.0
+        self.tilt_reported = False
         self.targets: list[Target] = []
         self.current_index = 0
         self.task_received = False
@@ -334,12 +408,25 @@ class InventoryCompetitionExecutor(Node):
         self._publish_flow("task_received")
         self._save_map()
         self.get_logger().info(f"收到任务：{len(targets)}个目标；先建立45槽位初始地图")
+        if SKIP_SCAN:
+            self._preload_map_from_layout()
 
     def _on_odom(self, msg: Odometry) -> None:
         p = msg.pose.pose
         self.x, self.y = float(p.position.x), float(p.position.y)
         q = p.orientation
-        self.yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        qx, qy, qz, qw = float(q.x), float(q.y), float(q.z), float(q.w)
+        self.yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        # 倾倒角：机体 z 轴与世界 z 轴的夹角（R[2][2] = 1 - 2(qx^2+qy^2)）
+        cos_tilt = max(-1.0, min(1.0, 1.0 - 2.0 * (qx * qx + qy * qy)))
+        self.tilt_deg = math.degrees(math.acos(cos_tilt))
+        if self.tilt_deg > TILT_ABORT_DEG and not self.tilt_reported and self.execute_enabled:
+            self.tilt_reported = True
+            self.get_logger().error(
+                f"[exec] 机器人倾角 {self.tilt_deg:.1f}° > 阈值 {TILT_ABORT_DEG:.0f}°，"
+                "疑似翻倒，立即停止本轮（不再空跑）"
+            )
+            self._finish_exec(False)
 
     def _on_detections(self, msg: Detection3DArray) -> None:
         now = time.monotonic()
@@ -355,10 +442,41 @@ class InventoryCompetitionExecutor(Node):
             world = (float(p.x), float(p.y), float(p.z))
             if not all(math.isfinite(v) for v in world):
                 continue
-            # 吸附到最近同类货位真值：消除检测抖动（实测最大 8cm）
-            snapped = self._snap_to_slot(kind, world)
-            if snapped is not None:
-                world = snapped
+            # 吸附到最近同类货位真值：消除检测抖动（实测最大 8cm）。
+            # ⚠️ 仅限固定基线（SUPERMARKET_SLOT_SNAP=1）：slot_truth 读的是
+            # 静态默认布局，随机布局下商品位置已重排——吸附和"就近同类回退"
+            # 会把本来大致正确的检测硬扳到错误位置（2026-09-12 实测 shupian
+            # 真实位置 D/L2 (0.70,3.243,0.956)，静态表写 B/L1/C3，机器人
+            # 对着 1.3m 外的空气闭爪）。随机流程回归纯检测+多帧稳定。
+            if SLOT_SNAP_ENABLED:
+                snapped = self._snap_to_slot(kind, world)
+                if snapped is not None:
+                    drift = math.sqrt(sum((world[i] - snapped[i]) ** 2 for i in range(3)))
+                    if not getattr(self, "_snap_logged", None):
+                        self._snap_logged = 0
+                    if self._snap_logged < 12:
+                        self._snap_logged += 1
+                        self.get_logger().info(
+                            f"[exec] 槽位吸附：{kind} 检测=({world[0]:.3f},{world[1]:.3f},{world[2]:.3f}) "
+                            f"→ 真值=({snapped[0]:.3f},{snapped[1]:.3f},{snapped[2]:.3f}) 修正 {drift * 100:.1f}cm"
+                        )
+                    world = snapped
+                elif self.slot_truth:
+                    # 吸附未命中（检测误差 > 半径）时不退回检测原值——那正是造成
+                    # 夹取不准的东西。改为就近取同类货位真值：任务只要求品类，
+                    # 任意同类副本都算有效，而货位坐标是已知真值，精度远高于视觉。
+                    nearest = self._nearest_same_kind_slot(kind)
+                    if nearest is not None:
+                        if not getattr(self, "_snap_fallback", 0):
+                            self._snap_fallback = 0
+                        self._snap_fallback += 1
+                        if self._snap_fallback <= 8:
+                            self.get_logger().warning(
+                                f"[exec] 吸附未命中，改用就近同类货位真值：{kind} "
+                                f"检测=({world[0]:.3f},{world[1]:.3f},{world[2]:.3f}) → "
+                                f"真值=({nearest[0]:.3f},{nearest[1]:.3f},{nearest[2]:.3f})"
+                            )
+                        world = nearest
             tracks = self.tracks[kind]
             match = None
             best = 0.16
@@ -390,6 +508,26 @@ class InventoryCompetitionExecutor(Node):
             if distance < best_distance:
                 best_distance, best = distance, slot_world
         return best
+
+    def _nearest_same_kind_slot(self, kind: str) -> tuple[float, float, float] | None:
+        """返回离机器人当前位置最近的同类货位真值坐标。
+
+        任务只要求品类（任意同类副本有效），而货位坐标是布局真值，
+        精度远高于 YOLO+RGB-D 的估计值（实测偏差 8~11cm）。
+        """
+        if not self.slot_truth:
+            return None
+        kind_key = str(kind).strip().lower()
+        candidates = [s for s in self.slot_truth if s["kind"] == kind_key]
+        if not candidates:
+            return None
+        rx = float(self.x) if self.x is not None else 0.0
+        ry = float(self.y) if self.y is not None else 0.0
+        best = min(
+            candidates,
+            key=lambda s: (s["world"][0] - rx) ** 2 + (s["world"][1] - ry) ** 2,
+        )
+        return best["world"]
 
     def _stable_world(self, track: Track, *, after: float | None = None) -> tuple[tuple[float, float, float], float, int] | None:
         now = time.monotonic()
@@ -651,6 +789,7 @@ class InventoryCompetitionExecutor(Node):
                 target = self._current()
                 if target is not None:
                     target.status = "grasping_plan"
+                    self.nav_retry = 0
                     self._publish_targets("target_navigation_reached")
                     self._publish_flow("target_navigation_reached")
                     self.get_logger().info(
@@ -665,7 +804,18 @@ class InventoryCompetitionExecutor(Node):
             else:
                 self.get_logger().info(f"[exec] 到达事件 phase={self.phase} mode={self.mapping_mode}（忽略）")
         elif state == "failed":
-            self.get_logger().warning(f"[exec] 导航失败：{payload.get('reason', '')}；由 nav worker 重启重试")
+            reason = str(payload.get("reason", ""))
+            self.nav_retry += 1
+            if self.nav_retry > NAV_RETRY_MAX:
+                self.get_logger().error(
+                    f"[exec] 导航连续失败 {self.nav_retry} 次（{reason}），放弃当前目标"
+                )
+                self.nav_retry = 0
+                self._fail_current(f"导航连续失败 {self.nav_retry} 次：{reason}")
+                return
+            self.get_logger().warning(
+                f"[exec] 导航失败 {self.nav_retry}/{NAV_RETRY_MAX}：{reason}；由 nav worker 重启重试"
+            )
 
     def _on_place_status(self, msg: String) -> None:
         try:
@@ -696,7 +846,7 @@ class InventoryCompetitionExecutor(Node):
     def _publish_grasp_meta(self, target: Target) -> None:
         if target.candidate is None or target.candidate.world is None:
             return
-        payload = {"schema_version": 1, "mode": "inventory_coordinator", "target_id": target.target_id, "kind": target.kind, "slot": target.candidate.slot, "object_world": target.candidate.world, "mechanical_commands_sent": False, "plan_only_allowed": True}
+        payload = {"schema_version": 1, "mode": "inventory_coordinator", "target_id": target.target_id, "kind": target.kind, "slot": target.candidate.slot, "object_world": target.candidate.world, "mechanical_commands_sent": False, "plan_only_allowed": True, "creep_extra_dy": round(float(getattr(self, "_servo_depth_extra", 0.0) or 0.0), 4)}
         self.grasp_meta_pub.publish(String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))))
         pose = PoseStamped()
         pose.header.frame_id = "world"
@@ -818,11 +968,20 @@ class InventoryCompetitionExecutor(Node):
             sys.executable, script,
             "--goal-topic", NAV_GOAL_TOPIC,
             "--max-speed", str(speed),
+            "--max-angular", str(DELIVERY_MAX_ANGULAR if planned_delivery else NAV_MAX_ANGULAR),
             "--obstacle-distance", str(nav_obstacle_distance),
             "--avoid-clearance", str(nav_avoid_clearance),
             "--speed-gain", str(gain),
             "--goal-tolerance", str(nav_goal_tolerance),
-            "--yaw-tolerance", "0.10",
+            # 抓取相关相位的导航朝向容差必须与 pregrasp odom 门禁一致
+            # （PREGRASP_ODOM_YAW_TOLERANCE）：导航器只对齐到自己容差内，
+            # 门禁更严就会出现 0.097 vs 0.06 这种"永远过不去"的重试死循环
+            # （实测整单因此夭折）。
+            "--yaw-tolerance", str(
+                PREGRASP_ODOM_YAW_TOLERANCE
+                if self.phase in {"target_nav", "pregrasp_nav"} or self.return_route_active
+                else 0.10
+            ),
             "--pickup-lateral-tolerance", "0.08",
             "--timeout", "240",
         ]
@@ -834,12 +993,12 @@ class InventoryCompetitionExecutor(Node):
                 command.append("--pickup-exact")
         if pickup_transit:
             command.append("--pickup-transit")
-        if planned_delivery and not self.no_obstacles:
+        # 配送段一律用 A* 预规划路径 + 保留雷达避障。
+        # 此前 no_obstacles 时会加 --ignore-obstacles 完全关掉雷达，
+        # 结果连场地上的静态方块都不避、直接撞上去（主人实测）。
+        # 静态障碍（方块/货架）与动态障碍不能混为一谈。
+        if planned_delivery:
             command.append("--planned-route")
-        if planned_delivery and self.no_obstacles:
-            # 无动态障碍单跑时关闭雷达干预，但保留普通目标控制，
-            # 不能把配送段误当作货架 pickup-approach。
-            command.append("--ignore-obstacles")
         self.get_logger().info(
             f"[exec] spawn nav worker: speed={speed} pickup={pickup} pickup_transit={pickup_transit} "
             f"planned_delivery={planned_delivery} no_obstacles={self.no_obstacles} "
@@ -858,12 +1017,64 @@ class InventoryCompetitionExecutor(Node):
         if self.nav_worker is None:
             self._spawn_nav(speed, pickup, pickup_transit)
 
+    def _read_servo_result(self) -> tuple[tuple[float, float, float], bool]:
+        """读手眼伺服结果文件；缺文件/超时（>60s 旧）视为未测量。"""
+        path = self.baseline_dir / SERVO_RESULT_PATH
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return (0.0, 0.0, 0.0), False
+        if time.time() - float(payload.get("wall_time", 0)) > 60.0:
+            return (0.0, 0.0, 0.0), False
+        correction = payload.get("correction")
+        if not isinstance(correction, list) or len(correction) != 3:
+            return (0.0, 0.0, 0.0), False
+        measured = bool(payload.get("measured", False))
+        try:
+            self._servo_standoff = float(payload.get("standoff_m", 0.0))
+        except (TypeError, ValueError):
+            self._servo_standoff = 0.0
+        return (float(correction[0]), float(correction[1]), float(correction[2])), measured
+
     def _spawn_arm(self, action: str) -> None:
         script_name, fixed_args = WORKER_CFG[action]
         script = str(self.baseline_dir / script_name)
         command = [sys.executable, script] + list(fixed_args)
         self.get_logger().info(f"[exec] spawn arm worker: {' '.join(command)}")
+        # 手眼渲染阶段开关：只在 servo worker 运行期间开（伺服只需几帧）。
+        # creep→retreat 全程常开会让重部署期间 RTF 掉到 0.22，deploy 的
+        # 关节收敛（仿真时间驱动）90s 墙钟不够用 → 硬超时（实测）。
+        flag = self.baseline_dir / "debug_data" / "handeye_render.flag"
+        try:
+            if action == "servo":
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                flag.write_text("servo", encoding="utf-8")
+            elif action in ("backoff", "backoff_far", "close_gripper", "retreat", "slide_up"):
+                flag.unlink(missing_ok=True)
+        except OSError:
+            pass
         self.arm_worker = subprocess.Popen(command)
+        self.arm_worker_started_at = time.monotonic()
+        self.arm_worker_action = action
+
+    def _arm_worker_hard_timeout(self) -> str | None:
+        """worker 挂死（自身超时失效）时强杀；返回被强杀的动作名，否则 None。"""
+        if self.arm_worker is None:
+            return None
+        started = getattr(self, "arm_worker_started_at", None)
+        if started is None:
+            return None
+        elapsed = time.monotonic() - started
+        if elapsed <= ARM_WORKER_HARD_TIMEOUT:
+            return None
+        action = getattr(self, "arm_worker_action", "unknown")
+        self.get_logger().error(
+            f"[exec] arm worker [{action}] 挂死 {elapsed:.0f}s > 硬超时 "
+            f"{ARM_WORKER_HARD_TIMEOUT:.0f}s，强制终止并继续流程"
+        )
+        self._stop_worker_process(self.arm_worker)
+        self.arm_worker = None
+        return action
 
     def _stop_worker_process(self, process: subprocess.Popen[Any] | None) -> None:
         if process is None:
@@ -1093,14 +1304,13 @@ class InventoryCompetitionExecutor(Node):
                 float(self.x) if self.x is not None else entry[0],
                 float(self.y) if self.y is not None else OBSERVE_Y,
             )
-            # 先沿货架前沿退出，再回到官方走廊入口，最后直达配送区。
-            points = [current, (current[0], 2.10), (-0.50, 2.10), entry, DELIVERY_GOAL[:2]]
-            speeds = [self.cruise_max_speed] * len(points)
+            # 货架前沿 → 走廊入口 → 配送台，两段直达。原中间两个 2.10
+            # 航点会造成"掉头 → 横移掉头 → 再掉回来"约 360° 原地转向；
+            # 无障碍模式下两点连线之间没有场景家具，可安全斜切。
+            points = [current, entry, DELIVERY_GOAL[:2]]
+            # 全程载货限速：翻车发生在载货段（实测倾角 47.1°），第一段不例外。
+            speeds = [min(self.cruise_max_speed, DELIVERY_SPEED)] * len(points)
             goals = self._route_points_to_goals(points, speeds)
-            if goals:
-                # 配送不是货架接近：第一个航点必须保持普通目标控制，
-                # 由 --ignore-obstacles 关闭雷达干预，不能误用 pickup-approach。
-                goals[0] = (*goals[0][:3], False, self.cruise_max_speed, False)
             self.get_logger().info(f"[exec] 无障碍直达配送路线：waypoints={len(goals)}")
             return goals
         corridor = self._plan_corridor_world(entry, DELIVERY_GOAL)
@@ -1108,9 +1318,12 @@ class InventoryCompetitionExecutor(Node):
             self.get_logger().error("动态配送路线生成失败，不使用可能撞障碍的固定航点")
             return []
         points = corridor
-        goals = self._route_points_to_goals(points, [min(self.cruise_max_speed, 0.30)] * len(points))
-        if goals:
-            goals[0] = (*goals[0][:3], False, self.cruise_max_speed, False)
+        # 首段（货架前沿→走廊入口）用载货限速，不再满速：满速载货正是
+        # 翻车敏感场景（实测倾角 47.1°）。走廊内维持 0.30 慢速绕障。
+        speeds = [min(self.cruise_max_speed, DELIVERY_SPEED, 0.30)] * len(points)
+        if speeds:
+            speeds[0] = min(self.cruise_max_speed, DELIVERY_SPEED)
+        goals = self._route_points_to_goals(points, speeds)
         self.get_logger().info(f"[exec] 动态配送路线：seed={self._obstacle_seed()} waypoints={len(goals)}")
         return goals
 
@@ -1298,6 +1511,35 @@ class InventoryCompetitionExecutor(Node):
         self.mapping_mode = "drive"
         self._sweep_drive_next()
 
+    def _preload_map_from_layout(self) -> None:
+        """按布局真值预填目标货位并直接进入执行阶段（跳过巡游扫描）。
+
+        比赛时限 420s，全扫描 5-8 分钟太贵。任务 kind 已知 + 布局固定，
+        等价信息直接从 45 槽位真值表得到。
+        """
+        if not self.slot_truth:
+            self.get_logger().error("[exec] 跳扫描失败：货位真值表为空，回退巡游扫描")
+            return
+        wanted = {t.kind for t in self.targets}
+        filled = 0
+        for slot in self.slot_truth:
+            if slot["kind"] not in wanted:
+                continue
+            entry = self.map.observe(
+                kind=slot["kind"],
+                world=slot["world"],
+                confidence=1.0,
+                samples=self.min_samples + 5,
+                source="layout_truth",
+            )
+            if entry is not None:
+                filled += 1
+        self.get_logger().warning(
+            f"[exec] 跳扫描：按布局真值直接定位 {filled} 个目标货位（{sorted(wanted)}），"
+            "跳过巡游扫描立即进入执行"
+        )
+        self._enter_execution()
+
     def _enter_execution(self) -> None:
         self.mapping_active = False
         self.map_completed_at = time.monotonic()
@@ -1315,6 +1557,11 @@ class InventoryCompetitionExecutor(Node):
         # 新目标开始前清理上一目标的 worker、旧 goal 和剩余分段航点；
         # 这样迟到的 reached/failed 消息不会被当成当前目标事件。
         self._reset_navigation_state(reason="切换到新目标")
+        # 重试配额按目标重置（此前跨目标累计，前一目标的失败会吃掉
+        # 后面目标的重试额度）
+        self.creep_retry = 0
+        self.servo_retry = 0
+        self.depth_probe_count = 0
         target = self._current()
         if target is None:
             self._finish_exec(True)
@@ -1340,7 +1587,10 @@ class InventoryCompetitionExecutor(Node):
         self._publish_flow("target_navigation_started")
 
     def _begin_pregrasp_retreat(self, target: Target) -> None:
-        """目标导航到位后先后退到底盘机械臂安全线，再做 IK 门禁。"""
+        """把底盘调整到预抓取线（必要时换列/退出/回正），再做 IK 门禁。
+
+        安全线本身是 creep/deploy 标定的基准位，不能省；但只有真的偏离
+        才发航点，不再执行固定的"掉头-后退-回正"三段舞步。"""
         if target.candidate is None or target.candidate.world is None:
             self._fail_current("预抓取阶段缺少目标坐标")
             return
@@ -1360,24 +1610,47 @@ class InventoryCompetitionExecutor(Node):
         current_x = float(self.x) if self.x is not None else goal_x
         current_y = float(self.y) if self.y is not None else OBSERVE_Y
         side_yaw = 0.0 if goal_x >= current_x else math.pi
-        self.drive_goals = [
-            # 先沿货架前沿精确横向对齐目标列；否则 pickup-approach
-            # 锁定法向行驶时无法修正 0.3m 级横向偏差。
-            (goal_x, current_y, side_yaw, True, self.mapping_max_speed, False),
-            # 再把车头转向 -Y 并沿法线反向退出货架；若仍使用 +Y，
-            # pickup-approach 会继续向货架前沿推进，无法真正后退。
-            (goal_x, ARM_PREGRASP_Y, -math.pi / 2.0, True, self.mapping_max_speed, False),
-            # 后退完成后用一个与实际安全线相差不超过容差的回正航点，
-            # 让导航器能在位置容差内原地回正，避免因浮点/物理误差
-            # 把回正段误当成继续向 +Y 前进。
-            (goal_x, ARM_PREGRASP_Y + PREGRASP_GOAL_TOLERANCE, math.pi / 2.0, True, self.mapping_max_speed, False),
-        ]
-        self._drive_next_goal()
-        self._publish_flow("pregrasp_retreat_started")
-        self.get_logger().info(
-            f"[exec] 目标导航到位，先反向退出到机械臂安全预抓取线，"
-            f"再回正朝向：({goal_x:.3f},{ARM_PREGRASP_Y + PREGRASP_GOAL_TOLERANCE:.3f})"
-        )
+        pregrasp_y = ARM_PREGRASP_Y + PREGRASP_GOAL_TOLERANCE
+        dx = current_x - goal_x
+        dy = current_y - pregrasp_y
+        goals: list[tuple[float, float, float, bool, float, bool]] = []
+        if abs(dx) > PREGRASP_GOAL_TOLERANCE * 0.8:
+            # 横向未对齐才需要沿货架前沿换列；pickup-approach 锁定法向
+            # 行驶时无法修正 0.3m 级横向偏差。
+            goals.append((goal_x, current_y, side_yaw, True, self.mapping_max_speed, False))
+        if dy > PREGRASP_GOAL_TOLERANCE * 0.8:
+            # 过冲贴近货架：pickup-approach 只能沿朝向前进，后退必须先掉头，
+            # 退出后再回正到预抓取线。
+            goals.append((goal_x, ARM_PREGRASP_Y, -math.pi / 2.0, True, self.mapping_max_speed, False))
+            goals.append((goal_x, pregrasp_y, math.pi / 2.0, True, self.mapping_max_speed, False))
+        elif goals or math.hypot(dx, dy) > PREGRASP_GOAL_TOLERANCE * 0.8:
+            # 横向换列后车头停在 ±X，或纵向差半步：补一个回正航点把
+            # 车头转回 +Y 并贴到线上，无需"后退-掉头"。
+            goals.append((goal_x, pregrasp_y, math.pi / 2.0, True, self.mapping_max_speed, False))
+        if not goals:
+            yaw_now = self.yaw if self.yaw is not None else math.pi / 2.0
+            yaw_err = abs(math.atan2(
+                math.sin(yaw_now - math.pi / 2.0), math.cos(yaw_now - math.pi / 2.0)
+            ))
+            if yaw_err > PREGRASP_ODOM_YAW_TOLERANCE * 0.8:
+                # 位置已到位但朝向超门禁：一个回正航点原地转头。
+                goals.append((goal_x, pregrasp_y, math.pi / 2.0, True, self.mapping_max_speed, False))
+        # 此前固定三航点在已到位时退化为"掉头 180°→退 5cm→再掉头 180°→
+        # 进 5cm"的零位移舞步，每个目标白耗 10 秒以上。现在只有真的需要
+        # 调整才发航点；位置/朝向交给 pregrasp odom 门禁复核，门禁失败
+        # 仍会回到本函数执行完整调整。
+        if goals:
+            self.drive_goals = goals
+            self._drive_next_goal()
+            self._publish_flow("pregrasp_retreat_started")
+            self.get_logger().info(
+                f"[exec] 预抓取调整 {len(goals)} 段 → ({goal_x:.3f},{pregrasp_y:.3f})"
+            )
+        else:
+            self.goal = [goal_x, pregrasp_y, math.pi / 2.0]
+            self._publish_flow("pregrasp_retreat_skipped")
+            self.get_logger().info("[exec] 底盘已在预抓取线，跳过调整直接进入 odom 门禁")
+            self._on_pregrasp_nav_reached()
 
     def _on_pregrasp_nav_reached(self) -> None:
         target = self._current()
@@ -1423,9 +1696,66 @@ class InventoryCompetitionExecutor(Node):
         self.pregrasp_stable_started_at = time.monotonic()
         self.pregrasp_stable_samples = 0
         self.pregrasp_last_pose = None
+        # 头部俯仰对准目标层：给抓前近距复核攒足该层的近距离检测样本
+        # （稳定等待 ~2s + REFINE_WINDOW 正好覆盖头部到位时间）。
+        level_pitch = {1: PITCH_SCAN[2][0], 2: PITCH_SCAN[1][0], 3: PITCH_SCAN[0][0]}.get(
+            getattr(target.candidate, "level", None)
+        )
+        if level_pitch is not None:
+            self._head(level_pitch)
         self._publish_targets("pregrasp_retreat_reached")
         self._publish_flow("pregrasp_odom_stability_started")
         self.get_logger().info("[exec] 已到机械臂安全线，等待 odom 连续稳定后执行 plan-only IK")
+
+    def _refine_target_before_ik(self, target: Target) -> None:
+        """抓前近距复核：用近距离检测更新目标坐标（伸爪前的最后一道校正）。
+
+        机器人已站在预抓取线，头部相机离货架仅 ~0.8m，此距离下的检测
+        精度远高于扫描期（扫描期实测常态 y/z 偏 2-5cm、极端个案 z 偏
+        29cm）。仅取旧目标 REFINE_MAX_RADIUS 半径内的样本做中位数，
+        防止把旁边货位的同类副本当成目标。检测不足时沿用扫描期坐标。
+        """
+        cand = target.candidate
+        if cand is None or cand.world is None:
+            return
+        now = time.monotonic()
+        old = cand.world
+        kind = str(target.kind).strip().lower()
+        samples: list[tuple[tuple[float, float, float], float]] = []
+        for track in self.tracks.get(kind, []):
+            for ts, world, conf in track.samples:
+                if now - ts > REFINE_WINDOW_S:
+                    continue
+                if math.dist(world, cand.world) > REFINE_MAX_RADIUS:
+                    continue
+                samples.append((world, conf))
+        if len(samples) < REFINE_MIN_SAMPLES:
+            self.get_logger().warning(
+                f"[exec] 近距复核：{kind} 近 {REFINE_WINDOW_S:.1f}s 内仅 "
+                f"{len(samples)}/{REFINE_MIN_SAMPLES} 个有效检测，"
+                f"沿用扫描期坐标（仅补偿 y 系统偏差 +{DETECTION_Y_BIAS * 100:.0f}cm）"
+            )
+            cand.world = (old[0], old[1] + DETECTION_Y_BIAS, old[2])
+            return
+        old = cand.world
+        refined = tuple(
+            sorted(w[i] for w, _ in samples)[len(samples) // 2] for i in range(3)
+        )
+        # y 系统偏差补偿：检测深度系统性偏近（见 DETECTION_Y_BIAS 注释）
+        refined = (refined[0], refined[1] + DETECTION_Y_BIAS, refined[2])
+        drift = math.dist(refined, old)
+        if drift <= 0.005:
+            self.get_logger().info(
+                f"[exec] 近距复核：{kind} 近距检测与扫描坐标一致（{len(samples)} 样本），不修正"
+            )
+            return
+        cand.world = refined
+        self.get_logger().info(
+            f"[exec] 近距复核：{kind} 目标 "
+            f"({old[0]:.3f},{old[1]:.3f},{old[2]:.3f}) → "
+            f"({refined[0]:.3f},{refined[1]:.3f},{refined[2]:.3f})，"
+            f"修正 {drift * 100:.1f}cm（{len(samples)} 样本，中位数）"
+        )
 
     def _begin_plan_gate(self) -> None:
         target = self._current()
@@ -1473,8 +1803,9 @@ class InventoryCompetitionExecutor(Node):
         if self.pregrasp_stable_samples >= ARM_ODOM_STABLE_SAMPLES:
             self.get_logger().info(
                 f"[exec] odom 已稳定 {self.pregrasp_stable_samples} 帧，"
-                f"pos=({pose[0]:.3f},{pose[1]:.3f}) yaw={pose[2]:.3f}，进入 plan-only IK"
+                f"pos=({pose[0]:.3f},{pose[1]:.3f}) yaw={pose[2]:.3f}，抓前近距复核"
             )
+            self._refine_target_before_ik(target)
             self._begin_plan_gate()
         elif now - self.last_log > 2.0:
             self.get_logger().info(
@@ -1575,6 +1906,11 @@ class InventoryCompetitionExecutor(Node):
             target.error = reason
             self.get_logger().error(f"[exec] 目标失败：{reason}")
             self._save_map()
+        # 手眼渲染阶段开关兜底关闭：worker 挂死/目标失败时不能让手眼常开
+        try:
+            (self.baseline_dir / "debug_data" / "handeye_render.flag").unlink(missing_ok=True)
+        except OSError:
+            pass
         self._reset_navigation_state(reason=f"当前目标失败：{reason}")
         self._publish_targets("target_failed")
         # 真实机械动作失败时可能仍然夹持商品或处于不安全姿态，不能直接继续
@@ -1662,6 +1998,9 @@ class InventoryCompetitionExecutor(Node):
             )
 
     def _arm_tick(self) -> None:
+        if self._arm_worker_hard_timeout() is not None:
+            self._fail_current("arm worker 挂死（硬超时）")
+            return
         target = self._current()
         if target is None:
             return
@@ -1677,6 +2016,25 @@ class InventoryCompetitionExecutor(Node):
         self.arm_worker = None
         if code != 0:
             action_now = ARM_ACTIONS[self.arm_index] if self.arm_index < len(ARM_ACTIONS) else "place"
+            if action_now == "servo":
+                # 伺服崩溃不应当作目标失败：跳过伺服继续闭爪（盲闭不比现状差）
+                self.get_logger().warning("[exec] 手眼伺服 worker 异常退出，跳过伺服直接闭爪")
+                self.arm_index += 1
+                self._start_arm_action()
+                return
+            if action_now == "close_gripper" and self.depth_probe_count < 3:
+                # 闭爪落空（夹空检测拦截）→ 伸入深度不足的强反馈：
+                # 停止线 +3cm 再 creep→close，最多探测 3 次。
+                self.depth_probe_count += 1
+                self._servo_depth_extra = (self._servo_depth_extra or 0.0) + 0.03
+                self.get_logger().warning(
+                    f"[exec] 闭爪落空，深度探测 {self.depth_probe_count}/3："
+                    f"creep 停止线 +3cm（累计 +{(self._servo_depth_extra) * 100:.0f}cm）"
+                )
+                self._publish_grasp_meta(target)
+                self.arm_index = ARM_ACTIONS.index("creep")
+                self._spawn_arm("creep")
+                return
             if action_now == "creep" and self.creep_retry < CREEP_RETRY_MAX:
                 self.creep_retry += 1
                 self.get_logger().warning(
@@ -1690,6 +2048,53 @@ class InventoryCompetitionExecutor(Node):
             self._fail_current(f"动作阶段 {action_now} 失败")
             return
         completed_action = ARM_ACTIONS[self.arm_index] if self.arm_index < len(ARM_ACTIONS) else "unknown"
+        last_action = self.arm_worker_action
+        # 伺服重部署序列（backoff_far → slide_up → deploy）
+        if self.servo_redeploy and last_action in ("backoff_far", "slide_up"):
+            if last_action == "backoff_far":
+                self.get_logger().info("[exec] 伺服重部署 1/3：已退离货架 30cm，抬手退出格子")
+                self._spawn_arm("slide_up")
+                return
+            self.servo_redeploy = False
+            self.arm_index = ARM_ACTIONS.index("deploy")
+            self.get_logger().info("[exec] 伺服重部署 2/3：就位，重新 deploy→creep→servo")
+            self._start_arm_action()
+            return
+        if completed_action == "servo":
+            # 手眼伺服：只修横向 x。z 由逐类 deploy_offset 校准（抓在罐身上部
+            # 是刻意设计：21cm 高罐的可用夹持带宽，且低位全伸展逼近工作空间
+            # 边界——实测往真值 z 修 7.4cm 后 deploy 关节误差卡 0.23 rad 不
+            # 收敛直到硬超时）。阻尼 0.7 防过冲（实测 +3.7 → 过冲到 -2.0）。
+            correction, measured = self._read_servo_result()
+            cand = target.candidate
+            clamped_dx = max(-0.03, min(0.03, correction[0] * 0.7))
+            # 伸入深度：表观尺寸测距被指头遮挡污染（实测 180px vs 预期 262px），
+            # 不可靠。深度改由"闭爪探测"闭环：夹空 → +3cm → 再 creep → 再闭。
+            lateral_ok = abs(clamped_dx) <= SERVO_APPLY_THRESHOLD
+            need_lateral = measured and not lateral_ok and cand is not None \
+                and cand.world is not None and self.servo_retry < SERVO_RETRY_MAX
+            if need_lateral:
+                self.servo_retry += 1
+                old = cand.world
+                cand.world = (old[0] + clamped_dx, old[1], old[2])
+                self.get_logger().warning(
+                    f"[exec] 手眼伺服：横向偏差 {correction[0] * 100:+.1f}cm"
+                    f"（垂直 {correction[2] * 100:+.1f}cm 忽略，z 由标定 dz 决定），"
+                    f"阻尼修正 {clamped_dx * 100:+.1f}cm，"
+                    f"目标 x {old[0]:.3f} → {cand.world[0]:.3f}，重部署 {self.servo_retry}/{SERVO_RETRY_MAX}"
+                )
+                self._publish_grasp_meta(target)
+                # 重部署序列：先退 30cm 脱离货架前沿，再抬手，再 deploy
+                self.servo_redeploy = True
+                self._spawn_arm("backoff_far")
+                return
+            if measured:
+                self.get_logger().info(
+                    f"[exec] 手眼伺服：偏差在阈值内（{correction[0] * 100:+.1f}, "
+                    f"{correction[2] * 100:+.1f})cm，直接闭爪"
+                )
+            else:
+                self.get_logger().warning("[exec] 手眼伺服未测得目标，盲闭（不比现状差）")
         if self.stop_after_close and completed_action == "close_gripper":
             target = self._current()
             if target is not None:
@@ -1719,6 +2124,25 @@ class InventoryCompetitionExecutor(Node):
         self._publish_flow("failed_recover_to_next")
 
     def _post_place_safe_pose_tick(self) -> None:
+        if self._arm_worker_hard_timeout() is not None:
+            # 收臂 worker 挂死：直接推进，不再重新 spawn（否则死循环）
+            self.post_place_safe_pose_active = False
+            self.recovering_from_failure = False
+            target = self._current()
+            if target is not None:
+                target.status = "failed"
+                self.get_logger().warning(
+                    f"[exec] 收臂 worker 硬超时，目标 {target.target_id} 标记失败并跳过"
+                )
+            self.current_index += 1
+            self._save_map()
+            if self.current_index < len(self.targets):
+                if not self.fixed_task_order:
+                    self._reorder_remaining_targets("post_place_safe_pose")
+                self._start_current_target()
+            else:
+                self._finish_exec(False)
+            return
         if self.arm_worker is None:
             self._fail_current("post_place_safe_pose worker 丢失")
             return
@@ -1823,9 +2247,11 @@ class InventoryCompetitionExecutor(Node):
         elif self.phase == "deliver":
             # 等待 nav reached → _begin_place（由 _on_nav_status 处理）。
             # 配送阶段使用独立计时，避免把建图/抓取耗时误算进配送超时。
+            # 独立常量：此前借用 map_timeout*2≈36s——RTF 0.45 时配送全程
+            # 需要 40-60s，看门狗把正常行驶的配送杀了（实测）。
             if (
                 self.deliver_started_at is not None
-                and now - self.deliver_started_at > self.map_timeout * 2
+                and now - self.deliver_started_at > DELIVER_NAV_TIMEOUT
             ):
                 self._fail_current("配送导航超时")
         elif self.phase == "place":

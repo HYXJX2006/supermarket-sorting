@@ -40,12 +40,15 @@ else
 fi
 
 HOLD_SECONDS="${HOLD_SECONDS:-45}"
+# 标定导航速度。0.30 是标定精度优先的保守值；演示/快速验证可传 0.6-0.8。
+NAV_SPEED="${NAV_SPEED:-0.30}"
 META_WINDOW="${META_WINDOW:-900}"
 # 拨动模式的截断点：STOP_AFTER=creep 时只跑 deploy+creep（夹爪保持张开），
 # 用于「拨动改变商品朝向」类策略——闭爪/抬升会破坏拨动效果。
 STOP_AFTER="${STOP_AFTER:-lift}"
-# creep 接近速度。轻且形状不规则的商品（如 sanmingzhi 三角形截面、0.122 kg）
-# 用 0.12 m/s 接近会在接触瞬间把商品推歪，表现为 SINGLE_FINGER 且 xy_shift 偏大。
+# creep 接近速度。默认 0.12 = 标定链基准值（标定与执行速度必须一致）。
+# 比赛流程不走这里：它用 grasp_geometry 的逐类 creep_speed（默认 0.15，
+# sanmingzhi/maidong 0.12）。要试更快就 CREEP_SPEED=0.15 覆盖并重验裁判真值。
 CREEP_SPEED="${CREEP_SPEED:-0.12}"
 # 拨转后的抓取：商品横在指间、creep 的 stop 线算不准会超时——这是预期的。
 # TOLERATE_CREEP_TIMEOUT=1 时 creep 失败不中止，继续 close+lift（靠过行程硬咬）。
@@ -106,6 +109,9 @@ fi
 find "$ROOT/baseline/__pycache__" -name '*.cpython-310.pyc' -delete 2>/dev/null || true
 
 if [[ "$HEADLESS" != "1" ]]; then
+  # 探针只测 WSLg unix socket；VcXsrv 等 TCP 形式的 DISPLAY（host:1）
+  # 直接跳过自检，避免被误判降级成 headless（丢窗口）。
+  if [[ "$DISPLAY_VALUE" == :* ]]; then
   X11PROBE_LOG=/tmp/x11probe_${LABEL}.log
   : > "$X11PROBE_LOG"
   docker run --rm -v /tmp/.X11-unix:/tmp/.X11-unix -e DISPLAY="$DISPLAY_VALUE" \
@@ -117,6 +123,7 @@ if [[ "$HEADLESS" != "1" ]]; then
     MUJOCO_GL_VALUE=osmesa
     DISPLAY_VALUE=""
     cat "$X11PROBE_LOG"
+  fi
   fi
 fi
 
@@ -136,12 +143,14 @@ docker run -d --name "$SERVER_NAME" $GPU_ARGS --network host --ipc host \
   -e SUPERMARKET_HEADLESS="$HEADLESS" \
   -e SUPERMARKET_ENABLE_RENDER=1 -e SUPERMARKET_ENABLE_LIDAR=1 \
   -e SUPERMARKET_USE_GS="$USE_GS" \
+  -e SUPERMARKET_GS_HEAD_ONLY="${SUPERMARKET_GS_HEAD_ONLY:-1}" \
+  -e SUPERMARKET_GS_ASYNC="${SUPERMARKET_GS_ASYNC:-1}" \
   -e SUPERMARKET_FIXED_BASELINE=1 -e SUPERMARKET_RANDOMIZE=0 \
   -e SUPERMARKET_RANDOMIZE_OBSTACLES=0 \
   -e SUPERMARKET_TASKS="$TARGET_ID" \
   -e SUPERMARKET_ENABLE_SCORE=1 \
   -e SUPERMARKET_GUI_RENDER_WIDTH=960 -e SUPERMARKET_GUI_RENDER_HEIGHT=600 \
-  -e SUPERMARKET_RENDER_FPS=12 \
+  -e SUPERMARKET_RENDER_FPS="${RENDER_FPS:-12}" \
   -e MAX_JOBS=2 -e TORCH_CUDA_ARCH_LIST=8.9 \
   -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
@@ -182,8 +191,11 @@ run_client "grasp_${LABEL}_safe_pose" \
   "python3 -u $BASELINE/safe_arm_controller.py safe_pose --execute --confirm safe_pose --timeout $SAFE_POSE_TIMEOUT"
 
 log "导航"
+# 朝向容差 0.05 rad：0.10（5.7°）在机械臂前伸 0.8m 处就是 ~8cm 横向偏差
+# （实测"歪着进货架→苹果偏到夹爪左侧"的直接根因）。
+YAW_TOL="${YAW_TOL:-0.05}"
 run_client "grasp_${LABEL}_nav" \
-  "python3 -u $BASELINE/low_speed_navigator.py --route '$NAV_ROUTE' --max-speed 0.30 --goal-tolerance 0.05 --timeout $NAV_TIMEOUT --ignore-obstacles"
+  "python3 -u $BASELINE/low_speed_navigator.py --route '$NAV_ROUTE' --max-speed $NAV_SPEED --goal-tolerance 0.05 --yaw-tolerance $YAW_TOL --timeout $NAV_TIMEOUT --ignore-obstacles"
 
 if [[ "$(docker inspect --format '{{.State.Status}}' "$SERVER_NAME" 2>/dev/null)" != "running" ]]; then
   log "Server 在导航后退出"

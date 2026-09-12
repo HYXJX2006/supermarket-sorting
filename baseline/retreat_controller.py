@@ -31,8 +31,8 @@ CMD_TOPIC = "/cmd_vel"
 PLAN_TOPIC = "/competition/retreat_plan"
 STATUS_TOPIC = "/competition/retreat_status"
 
-RETREAT_SPEED = 0.04
-RETREAT_DISTANCE = 0.55
+RETREAT_SPEED = 0.10   # 回退：0.16 过猛
+RETREAT_DISTANCE = 0.30   # S3 阈值仅 0.20m，撤 0.30 足够
 REAR_CLEARANCE = 0.35
 YAW_KP = 1.2
 

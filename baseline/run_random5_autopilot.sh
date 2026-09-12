@@ -16,12 +16,17 @@ IMAGE_SERVER="${IMAGE_SERVER:-crpi-1pzq998p9m7w0auy.cn-hangzhou.personal.cr.aliy
 IMAGE_CLIENT="${IMAGE_CLIENT:-crpi-1pzq998p9m7w0auy.cn-hangzhou.personal.cr.aliyuncs.com/challengecup/supermarket_sorting_final:client}"
 SEED="${SUPERMARKET_SEED:-11}"
 DOMAIN="${ROS_DOMAIN_ID:-99}"
-CRUISE="${CRUISE_MAX_SPEED:-1.2}"          # 长直 clear 段巡航速度
-MAPPING_SPEED="${MAPPING_SPEED:-0.35}"     # 货架前扫描巡游限速
-OBSTACLE_DIST="${OBSTACLE_DIST:-0.5}"      # 配送段动态避障触发距离
+CRUISE="${CRUISE_MAX_SPEED:-1.4}"          # 回退：2.2 时急停惯性大，翻车
+MAPPING_SPEED="${MAPPING_SPEED:-0.60}"     # 回退：1.00 过猛
+OBSTACLE_DIST="${OBSTACLE_DIST:-0.35}"     # 配送段动态避障触发距离（比赛提速）
 RANDOMIZE_OBSTACLES="${SUPERMARKET_RANDOMIZE_OBSTACLES:-1}"
 REMOVE_CORRIDOR_OBSTACLES="${SUPERMARKET_REMOVE_CORRIDOR_OBSTACLES:-0}"
 TASK_COUNT="${SUPERMARKET_TASK_COUNT:-5}"
+# 跳巡游扫描（比赛时限 420s，全扫描要 5-8 分钟）：用任务 kind + 45 槽位布局
+# 真值直接定位目标货位并立即进入执行。
+SKIP_SCAN="${SUPERMARKET_SKIP_SCAN:-0}"   # 暂缓：首个目标会落入 pickup-transit
+# 货架横移模式走 5.5m 长距离（龟速 0.005m/s，实测卡死），需改导航层再启用。
+# 现阶段用"扫描加速"（巡游 0.7 + 停留 1.5s）把扫描从 5-8 分钟压到 2-3 分钟。
 TASKS_SPEC="${SUPERMARKET_TASKS:-}"
 SCORE_ENABLED="${SUPERMARKET_ENABLE_SCORE:-1}"
 TASK_ORDER_LOCKED="${SUPERMARKET_TASK_ORDER_LOCKED:-0}"
@@ -39,7 +44,7 @@ GRIP_THRESHOLD="${SUPERMARKET_GRIP_CLOSED_FEEDBACK_MAX:-0.85}"
 SHUPIAN_CREEP_STOP_DY="${SUPERMARKET_SHUPIAN_CREEP_STOP_DY:-0.035}"
 SHUPIAN_CREEP_Y_TOL="${SUPERMARKET_SHUPIAN_CREEP_Y_TOL:-0.025}"
 HEADLESS="${SUPERMARKET_HEADLESS:-0}"      # 0=显示 X11 窗口
-USE_GS="${SUPERMARKET_USE_GS:-1}"          # 1=3DGS实时画面；0=MuJoCo native
+USE_GS="${SUPERMARKET_USE_GS:-1}"   # 1=3DGS 渲染（走 GS 管线，绕开崩过的原生 mjr_render）；相机图像可用          # 1=3DGS实时画面；0=MuJoCo native
 GS_BATCH_RENDER="${SUPERMARKET_GS_BATCH_RENDER:-1}"
 RENDER_FPS="${SUPERMARKET_RENDER_FPS:-6}"
 GS_HEAD_ONLY="${SUPERMARKET_GS_HEAD_ONLY:-1}"   # 1=仅头部+第三人称走 GS；开 0(手眼也 GS) 会把异步渲染线程压满，相机帧率崩溃导致检测凑不齐槽位（实测 observed=0/45）
@@ -58,7 +63,12 @@ MAP_CONFIDENCE="${SUPERMARKET_MAP_CONFIDENCE:-0.25}"
 # 与 run_item_grasp.sh 同款，实测可靠。此前默认 VcXsrv TCP（NAT 网关:0.0）
 # 在 MUJOCO_GL=glfw 下 GLX 握手失败（gladLoadGL error → Server 崩、odom 断流、
 # executor 死等建图）。如坚持 VcXsrv 可显式传 X11_DISPLAY=192.168.x.x:0.0。
-X11_DISPLAY="${X11_DISPLAY:-:0}"
+# 默认走 VcXsrv :1（TCP），不用 WSLg :0：
+#   WSLg 的 RDP 共享内存通道损坏（weston 日志 rdp_allocate_shared_memory
+#   I/O error）→ 窗口变成 [WARN:COPY MODE]，渲染不出来。
+#   VcXsrv 用 :1 是因为 :0 已被 WSLg 占用（抢 :0 会静默绑定失败）。
+# 启动前需在 Windows 侧运行 start_x.bat（VcXsrv :1 + 防火墙规则）。
+X11_DISPLAY="${X11_DISPLAY:-172.25.192.1:1}"
 SERVER_NAME="random5_autopilot_server"
 CLIENT_NAME="random5_autopilot_client"
 
@@ -141,6 +151,17 @@ docker run -d --name "$SERVER_NAME" --gpus all --network host --ipc host \
   "$IMAGE_SERVER" bash -lc \
   'cd /workspace/supermarket_sorting_task && source /opt/ros/humble/setup.bash && python3 -u /workspace/baseline/random_server_bootstrap.py'
 
+TELEM_STAMP="$(date +%Y%m%d_%H%M%S)"
+TELEM_REL="debug_data/random5_telem/${TELEM_STAMP}_seed${SEED}"
+mkdir -p "$ROOT/baseline/debug_data/random5_telem"
+echo "==> 启动裁判遥测记录器（商品侧 ground truth）：$TELEM_REL"
+docker run -d --name "${SERVER_NAME}_telem" --network host --ipc host \
+  -e ROS_DOMAIN_ID="$DOMAIN" \
+  -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+  -v "$ROOT/baseline:/workspace/baseline:rw" \
+  "$IMAGE_CLIENT" bash -lc \
+  "source /opt/ros/humble/setup.bash && python3 -u /workspace/baseline/debug_data/referee_target_monitor.py --output-dir /workspace/baseline/$TELEM_REL --duration 1500"
+
 echo "==> 启动 Client：检测 + 自主执行（executor 自动 spawn 巡游/抓取/配送 worker）"
 docker run -d --name "$CLIENT_NAME" --gpus all --network host --ipc host \
   -e ROS_DOMAIN_ID="$DOMAIN" \
@@ -156,7 +177,8 @@ docker run -d --name "$CLIENT_NAME" --gpus all --network host --ipc host \
   -e SUPERMARKET_ARM_PREGRASP_Y="$ARM_PREGRASP_Y" \
   -e SUPERMARKET_ARM_ODOM_STABLE_SAMPLES="$ARM_ODOM_STABLE_SAMPLES" \
   -e SUPERMARKET_PLAN_GATE_TIMEOUT="$PLAN_GATE_TIMEOUT" \
-  -e SUPERMARKET_PITCH_DWELL_S="${SUPERMARKET_PITCH_DWELL_S:-4.0}" \
+  -e SUPERMARKET_PITCH_DWELL_S="${SUPERMARKET_PITCH_DWELL_S:-1.0}" \
+  -e SUPERMARKET_SKIP_SCAN="$SKIP_SCAN" \
   -e DISPLAY="$X11_DISPLAY" \
   -e MUJOCO_GL="${MUJOCO_GL:-glfw}" \
   -e QT_X11_NO_MITSHM=1 \

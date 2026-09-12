@@ -97,7 +97,12 @@ class InventoryMap:
                 return entry
         if entry.kind is None or incoming_kind != entry.kind or confidence >= entry.confidence:
             entry.kind = incoming_kind
-            entry.world = [round(float(v), 5) for v in world]
+            # 已预订/取放中的条目坐标冻结：world 是抓取目标，抓前近距复核
+            # （executor._refine_target_before_ik）刚校正过的坐标若被后续
+            # 检测流覆盖，机械臂就会抓向旧位置（2026-09-12 实测复核修正
+            # 6cm 后被冲回 -1.9cm，闭爪落空）。
+            if entry.state not in ("reserved", "picking", "picked"):
+                entry.world = [round(float(v), 5) for v in world]
             entry.confidence = confidence
             entry.samples = max(entry.samples, samples)
             entry.source = source

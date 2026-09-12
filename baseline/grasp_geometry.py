@@ -46,6 +46,10 @@ class GraspGeometry:
     # 夹空检测下限：闭爪后 feedback 低于该值 = 指头越过商品闭到指令位
     # （没夹到东西）。0 = 不启用。比赛流程靠它识别"空手配送"。
     grip_feedback_min: float = 0.0
+    # creep 接近速度（m/s），逐类标定值。0.15 是 09-11 翻车排查后的安全上限；
+    # 轻且形状不规则（sanmingzhi 顶推敏感）、预压敏感（maidong 滑）的类别
+    # 保留标定时的 0.12。覆盖通道：SUPERMARKET_<KIND>_CREEP_SPEED。
+    creep_speed: float = 0.15
 
     def to_dict(self) -> dict[str, object]:
         """输出可写入 ROS JSON 的稳定元数据。"""
@@ -84,6 +88,7 @@ DEFAULT_GEOMETRY = GraspGeometry(
     calibrated=False,
     grip_close=float(os.getenv("SUPERMARKET_GRIP_CLOSE", "0.08")),
     grip_feedback_max=float(os.getenv("SUPERMARKET_GRIP_FEEDBACK_MAX", "0.85")),
+    creep_speed=float(os.getenv("SUPERMARKET_CREEP_SPEED", "0.15")),
 )
 
 # --- 夹爪开口换算：来自官方 MJCF，不是经验值 -----------------------------
@@ -142,6 +147,8 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         surface_to_center_fwd=0.0050,
         deploy_offset=DEFAULT_GEOMETRY.deploy_offset,
         creep_stop_dy=DEFAULT_GEOMETRY.creep_stop_dy,
+        # 标定（得分 890.4 那轮）用 0.12 接近；轻且正面斜面，速度敏感。
+        creep_speed=0.12,
         shape="mesh_prism",
         dimensions_m=(0.0650, 0.1000, 0.0988),
         mass_kg=0.1220,
@@ -173,8 +180,15 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
     ),
     "shupian": GraspGeometry(
         surface_to_center_fwd=0.0325,
-        deploy_offset=DEFAULT_GEOMETRY.deploy_offset,
-        creep_stop_dy=DEFAULT_GEOMETRY.creep_stop_dy,
+        # 2026-09-12：dz 从 -0.010 抬到 +0.030。实测 L2 货位接近时手（指+
+        # 掌+腕）前端刮到下层板前沿，底盘推进被层板抵住（ee_y 卡 3.150，
+        # 每秒仅 0.5mm，主人目视确认"被薯片下面的货架板抵住"）。罐高 0.21，
+        # 指头抓在中心上方 3cm 依然稳定，整只手随之上抬离开层板沿。
+        deploy_offset=(-0.011, -0.220, 0.030),
+        # 2026-09-12 深夜：0.035 时指头平面落后罐身 ~2cm（比赛流程连续夹空），
+        # 0.010（停止线深 2.5cm）+ 手眼伺服横向收敛后抓取成功
+        # （feedback 0.8091 ≈ 预测 0.813，抬升成功）。
+        creep_stop_dy=0.010,
         shape="cylinder",
         dimensions_m=(0.0650, 0.0650, 0.2100),
         mass_kg=0.1370,
@@ -201,6 +215,8 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         surface_to_center_fwd=0.0325,
         deploy_offset=DEFAULT_GEOMETRY.deploy_offset,
         creep_stop_dy=DEFAULT_GEOMETRY.creep_stop_dy,
+        # 预压敏感（0.060 滑 / 0.040 压歪），最重 0.643kg，接近速度保守。
+        creep_speed=0.12,
         shape="cylinder",
         dimensions_m=(0.0650, 0.0650, 0.2100),
         mass_kg=0.6430,
@@ -316,6 +332,11 @@ def _kind_geometry(kind: str, base: GraspGeometry) -> GraspGeometry:
         calibrated=os.getenv(prefix + "CALIBRATED", str(base.calibrated)).lower() in {"1", "true", "yes"},
         grip_close=float(os.getenv(prefix + "GRIP_CLOSE", str(base.grip_close))),
         grip_feedback_max=float(os.getenv(prefix + "GRIP_FEEDBACK_MAX", str(base.grip_feedback_max))),
+        # 夹空检测下限：2026-09-12 实测整场漏抓——_kind_geometry 重建时
+        # 漏了这个字段，八类全部静默回落 0.0（检测不启用），夹空 feedback
+        # 0.08 照样被 lift 放行、空手配送。逐类值见 _OFFICIAL_GEOMETRY。
+        grip_feedback_min=float(os.getenv(prefix + "GRIP_FEEDBACK_MIN", str(base.grip_feedback_min))),
+        creep_speed=float(os.getenv(prefix + "CREEP_SPEED", str(base.creep_speed))),
     )
 
 

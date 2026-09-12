@@ -106,8 +106,22 @@ class SimulatorBase:
             os.getenv("SUPERMARKET_GS_ASYNC", "1").strip().lower()
             in {"1", "true", "yes", "on"}
         )
+        # 手眼相机（left=1/right=2）走原生 MuJoCo 渲染进 ROS 话题，不进 GS
+        # 批量：伺服与三视角审查需要手眼图像，但 GS 批量渲三路会把异步渲染
+        # 线程压满（实测 RTF 掉到 0.3）。原生小图开销极低（GUI 手眼切换同款
+        # 渲染路径，主人实测不卡）。SUPERMARKET_HAND_EYE_NATIVE=0 可关闭。
+        self._native_obs_cam_ids = (
+            {1, 2}
+            if os.getenv("SUPERMARKET_HAND_EYE_NATIVE", "1").strip().lower()
+            in {"1", "true", "yes", "on"}
+            else set()
+        )
         self._gs_render_lock = threading.Lock()
         self._gs_render_thread = None
+        # 手眼渲染阶段开关：executor 在 creep 前写标志文件、retreat 后删除。
+        # 常开原生手眼会把 RTF 拖到 0.22（2026-09-12 实测），阶段开关让
+        # 扫描/导航阶段零开销。文件在 baseline 挂载卷上，两端容器都可见。
+        self._hand_eye_flag_path = "/workspace/baseline/debug_data/handeye_render.flag"
 
         if self.config.enable_render:
             self.free_camera = mujoco.MjvCamera()
@@ -474,50 +488,25 @@ class SimulatorBase:
 
     def _schedule_async_gs_render(self, render_width: int, render_height: int) -> None:
         """Snapshot MuJoCo state and render 3DGS without blocking physics."""
+        native_ids = getattr(self, "_native_obs_cam_ids", ())
         obs_cam_ids = sorted(set(self.config.obs_rgb_cam_id + self.config.obs_depth_cam_id))
+        # 原生手眼不进 GS 批量：它们的图像由 render() 用 getRgbImg/getDepthImg 填充
+        obs_cam_ids = [cid for cid in obs_cam_ids if cid not in native_ids]
         if not obs_cam_ids or not hasattr(self, "gs_renderer"):
             return
-        # 第三人称（free camera，id=-1）纳入异步批量渲染：GUI 窗口的
-        # display_result 取自 batch_render_results[display_cam_id]，不加入
-        # 则第三人称回退原生网格渲染（三视角真实感要求）。
-        include_free = (not self.config.headless) and self.window is not None and hasattr(self, "free_camera")
         with self._gs_render_lock:
             if self._gs_render_thread is not None and self._gs_render_thread.is_alive():
                 return
             body_ids = np.asarray(self.gs_renderer.gs_body_ids, dtype=np.int32)
             body_pos = self.mj_data.xpos[body_ids].copy()
             body_quat = self.mj_data.xquat[body_ids].copy()
-            cam_ids = list(obs_cam_ids)
+            cam_ids = np.asarray(obs_cam_ids, dtype=np.int32)
             cam_pos = self.mj_data.cam_xpos[cam_ids].copy()
             cam_xmat = self.mj_data.cam_xmat[cam_ids].copy()
             fovy = self.mj_model.cam_fovy[cam_ids].copy()
-            if include_free:
-                fc = self.free_camera
-                az = math.radians(fc.azimuth)
-                el = math.radians(fc.elevation)
-                forward = np.array([
-                    math.cos(el) * math.cos(az),
-                    math.cos(el) * math.sin(az),
-                    math.sin(el),
-                ])
-                fc_pos = np.asarray(fc.lookat, dtype=float) - forward * float(fc.distance)
-                zaxis = -forward
-                up = np.array([0.0, 0.0, 1.0])
-                xaxis = np.cross(up, zaxis)
-                xaxis /= max(float(np.linalg.norm(xaxis)), 1e-9)
-                yaxis = np.cross(zaxis, xaxis)
-                fc_xmat = np.column_stack([xaxis, yaxis, zaxis])
-                fc_fovy = float(getattr(self.mj_model.vis.global_, "fovy", 45.0))
-                cam_ids = cam_ids + [-1]
-                # mj_data.cam_xmat 每行是 3x3 的展平（9 元素），free camera
-                # 需同样展平后再 vstack（否则维度 9 vs 3 不匹配）。
-                cam_pos = np.vstack([cam_pos, fc_pos.reshape(1, 3)])
-                cam_xmat = np.vstack([cam_xmat, fc_xmat.reshape(1, 9)])
-                fovy = np.append(fovy, fc_fovy)
-            cam_id_arr = np.asarray(cam_ids, dtype=np.int32)
             self._gs_render_thread = threading.Thread(
                 target=self._async_gs_render_worker,
-                args=(body_pos, body_quat, cam_pos, cam_xmat, fovy, render_width, render_height, cam_id_arr),
+                args=(body_pos, body_quat, cam_pos, cam_xmat, fovy, render_width, render_height, obs_cam_ids),
                 name="gs-render",
                 daemon=True,
             )
@@ -625,6 +614,30 @@ class SimulatorBase:
                     for cid, (rgb, depth) in self.batch_render_results.items():
                         self.img_rgb_obs_s[cid] = rgb
                         self.img_depth_obs_s[cid] = depth
+
+            # 原生手眼填充：left/right 相机每 tick 用 getRgbImg/getDepthImg
+            # 渲染进 ROS 话题（伺服与审查用）。原生小图开销极低，不走 GS 批量。
+            # 阶段开关：executor 在抓取阶段写 handeye_render.flag，其余阶段
+            # 不渲染（常开会把 RTF 拖到 0.22）。
+            native_obs = sorted(getattr(self, "_native_obs_cam_ids", ()) or ())
+            if native_obs and os.path.exists(self._hand_eye_flag_path):
+                rgb_ids = [nid for nid in native_obs if nid in self.config.obs_rgb_cam_id]
+                depth_ids = [nid for nid in native_obs if nid in self.config.obs_depth_cam_id]
+                depth_rendering = self.renderer._depth_rendering
+                if rgb_ids:
+                    self.renderer.disable_depth_rendering()
+                    try:
+                        for nid in rgb_ids:
+                            self.img_rgb_obs_s[nid] = self.getRgbImg(nid)
+                    finally:
+                        self.renderer._depth_rendering = depth_rendering
+                if depth_ids:
+                    self.renderer.enable_depth_rendering()
+                    try:
+                        for nid in depth_ids:
+                            self.img_depth_obs_s[nid] = self.getDepthImg(nid)
+                    finally:
+                        self.renderer._depth_rendering = depth_rendering
 
             # 3DGS RGB does not contain the MJCF ArUco tiles. If requested,
             # render native ArUco frames on the physics/GL thread only.
