@@ -617,10 +617,11 @@ class SimulatorBase:
 
             # 原生手眼填充：left/right 相机每 tick 用 getRgbImg/getDepthImg
             # 渲染进 ROS 话题（伺服与审查用）。原生小图开销极低，不走 GS 批量。
-            # 阶段开关：executor 在抓取阶段写 handeye_render.flag，其余阶段
-            # 不渲染（常开会把 RTF 拖到 0.22）。
+            # ⚠️ 必须每 tick 无条件填充：obs 列表含 cam 1/2 时，下游 obs 字典
+            # 需要这些键常驻——曾经用 handeye_render.flag 门控，标志关闭期间
+            # 缓冲不填充导致 obs 管线异常（地图只收到 4/45 槽位，实测）。
             native_obs = sorted(getattr(self, "_native_obs_cam_ids", ()) or ())
-            if native_obs and os.path.exists(self._hand_eye_flag_path):
+            if native_obs:
                 rgb_ids = [nid for nid in native_obs if nid in self.config.obs_rgb_cam_id]
                 depth_ids = [nid for nid in native_obs if nid in self.config.obs_depth_cam_id]
                 depth_rendering = self.renderer._depth_rendering

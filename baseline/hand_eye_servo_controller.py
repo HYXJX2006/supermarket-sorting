@@ -36,7 +36,7 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image, JointState
-from std_msgs.msg import String
+from std_msgs.msg import Float64MultiArray, String
 
 TASK_DIR = Path("/workspace/supermarket_sorting_task/examples/supermarket_sorting")
 if not (TASK_DIR / "mmk2_kdl.py").is_file():
@@ -92,6 +92,11 @@ class HandEyeServo(Node):
         self.create_subscription(CameraInfo, INFO_TOPIC, self._on_info, qos_profile_sensor_data)
         self.create_subscription(JointState, "/joint_states", self._on_joints, qos_profile_sensor_data)
         self.create_subscription(Odometry, ODOM_TOPIC, self._on_odom, qos_profile_sensor_data)
+        # 微调用执行器：关节1（肩部横摆→世界 x）与升降柱（世界 z 1:1）
+        self.arm_cmd_pub = self.create_publisher(
+            Float64MultiArray, "/right_arm_forward_position_controller/commands", 10)
+        self.spine_cmd_pub = self.create_publisher(
+            Float64MultiArray, "/spine_forward_position_controller/commands", 10)
 
     # ---------- callbacks ----------
     def _on_meta(self, message: String) -> None:
@@ -235,22 +240,55 @@ class HandEyeServo(Node):
                 "lateral_err_m": round(err_lateral, 4),
                 "vertical_err_m": round(err_vertical, 4),
             })
-            if abs(err_lateral) <= self.lateral_tol_m and abs(err_vertical) <= self.lateral_tol_m:
+            if abs(err_lateral) <= self.lateral_tol_m and abs(err_vertical) <= 0.015:
                 converged = True
                 break
-            # 目标修正：商品相对瞄准点偏 (dx, dz)，把目标挪过去
-            dx = self.u_sign * err_lateral
-            dz = -err_vertical
-            correction_total[0] += dx
-            correction_total[1] += dz
-            if self.target_world is not None:
-                self.target_world = (
-                    self.target_world[0] + dx,
-                    self.target_world[1],
-                    self.target_world[2] + dz,
-                )
-            # 修正需要经 executor 重部署生效，单次测量即返回
-            break
+            # ---- 预抓取位横向校准（主人的分阶段方案第②步）----
+            # 关节选择用数值 FK 灵敏度：j3 是水平面关节（dx=0.335, dz=0），
+            # 关节1 不是（dx=0.128 且污染 y/z——用它修正无效，实测误差不变）。
+            # j3 的 y 副作用由 creep 的绝对 y 停止线自动吸收（底盘前送补偿）。
+            ee = self._ee_world()
+            if ee is None:
+                break
+            q = [self.joints["slide_joint"]] + [
+                self.joints[f"right_arm_joint{i}"] for i in range(1, 7)
+            ]
+            h = 0.02
+            try:
+                _, t0 = self.kdl.forward_kinematics(q, index="right")
+                q3 = list(q)
+                q3[3] += h   # j3
+                _, t3 = self.kdl.forward_kinematics(q3, index="right")
+                c, s = math.cos(self.yaw), math.sin(self.yaw)
+                wx0 = c * t0[0, 3] - s * t0[1, 3]
+                wx3 = c * t3[0, 3] - s * t3[1, 3]
+                sens = (wx3 - wx0) / h   # world x per j3 rad
+            except Exception:
+                sens = 0.0
+            if abs(sens) < 0.05:
+                result["reason"] = f"j3 横向灵敏度过低（{sens:.3f}），无法修正"
+                break
+            dj3 = max(-0.15, min(0.15, err_lateral / sens))
+            if abs(dj3) < 1e-3:
+                continue
+            arm_msg = Float64MultiArray()
+            arm_msg.data = [q[1], q[2], q[3] + dj3, q[4], q[5], q[6], 1.0]
+            self.arm_cmd_pub.publish(arm_msg)
+            correction_total[0] += dj3 * sens
+            self.get_logger().info(
+                f"横向校准 {iteration+1}: dj3={dj3:+.4f} "
+                f"(err_lat={err_lateral*100:+.1f}cm, sens={sens:.3f})"
+            )
+            # 等关节真的到位：真正睡 1.2s（spin_once 会被高频回调立即打断，
+            # 0.04s 后就测下一帧会读到未动的画面），且要求拿到比修正时刻
+            # 新的图像帧
+            t_move = time.monotonic()
+            while time.monotonic() - t_move < 1.2 and rclpy.ok():
+                rclpy.spin_once(self, timeout_sec=0.05)
+            while (self.latest_image and self.latest_image[0] < t_move
+                   and time.monotonic() - t_move < 4.0 and rclpy.ok()):
+                rclpy.spin_once(self, timeout_sec=0.05)
+            continue
 
         result.update({
             "measured": True,
@@ -285,10 +323,10 @@ def main() -> int:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm", default="")
     parser.add_argument("--timeout", type=float, default=40.0)
-    parser.add_argument("--max-iterations", type=int, default=2)
+    parser.add_argument("--max-iterations", type=int, default=1)
     parser.add_argument("--lateral-tol-m", type=float, default=0.012)
     parser.add_argument("--u-sign", type=float,
-                        default=float(os.getenv("SUPERMARKET_SERVO_U_SIGN", "1.0")),
+                        default=float(os.getenv("SUPERMARKET_SERVO_U_SIGN", "-1.0")),
                         help="图像 u 轴到世界 x 轴的方向符号（一次实测标定）")
     parser.add_argument("--u0", type=float, default=float(os.getenv("SUPERMARKET_SERVO_U0", "5.9")),
                         help="光轴标定：对中参考 u 像素（2026-09-12 苹果标定位姿实测）")

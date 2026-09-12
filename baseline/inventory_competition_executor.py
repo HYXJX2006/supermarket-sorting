@@ -165,6 +165,9 @@ TRACK_STABILITY_WINDOW = max(6, _env_int("SUPERMARKET_TRACK_STABILITY_WINDOW", 8
 # 这些 worker 只控制机械臂/夹爪/升降柱，不控底盘；底盘由本 executor 独占。
 # servo：creep 到位后、闭爪前的手眼伺服——测"手指-商品"横向/高度偏差，
 # 超阈值则回退重部署（复用 creep-retry 的 backoff→deploy→creep 通道）。
+# 动作顺序：降到同高（deploy）→ 进深（creep）→ 抓取面手眼微调（servo：
+# 测"手指-商品"横向/高度偏差，直接调关节1+升降柱修正 creep 前进漂移，
+# 不重部署）→ 闭爪（夹空则 +3cm 深度探测再 creep→servo→close）。
 ARM_ACTIONS = ("safe_pose", "deploy", "creep", "servo", "close_gripper", "lift", "retreat", "slide_reset")
 POST_PLACE_SAFE_POSE = "post_place_safe_pose"
 # 手眼伺服：偏差超过 SERVO_APPLY_THRESHOLD 则带修正量回退重部署；
@@ -1877,6 +1880,14 @@ class InventoryCompetitionExecutor(Node):
         self.phase = "deliver"
         self.deliver_started_at = time.monotonic()
         self.observe_row = False
+        # 清掉残留导航进程：僵尸 navigator 仍在往 /cmd_vel 发零速，与新
+        # 配送 worker 的驱动指令互相覆盖，底盘被冻在原地（实测 pos/heading
+        # 10 秒纹丝不动、雷达活着）。配送 worker 由下面 _drive_next_goal
+        # 全新 spawn，不受影响。
+        try:
+            subprocess.run(["pkill", "-f", "low_speed_navigator.py"], timeout=5.0)
+        except Exception:
+            pass
         self.drive_goals = self._delivery_route()
         self._drive_next_goal()
         self._publish_flow("deliver_navigation_started")
@@ -2022,14 +2033,16 @@ class InventoryCompetitionExecutor(Node):
                 self.arm_index += 1
                 self._start_arm_action()
                 return
-            if action_now == "close_gripper" and self.depth_probe_count < 3:
+            if action_now == "close_gripper" and self.depth_probe_count < 4:
                 # 闭爪落空（夹空检测拦截）→ 伸入深度不足的强反馈：
                 # 停止线 +3cm 再 creep→close，最多探测 3 次。
                 self.depth_probe_count += 1
-                self._servo_depth_extra = (self._servo_depth_extra or 0.0) + 0.03
+                # 步长 1.5cm：+3cm 步长实测在最优深度两侧跳变
+                # （+3cm 时 feedback 0.32 部分接触、+6cm 回落 0.08 全空）
+                self._servo_depth_extra = (self._servo_depth_extra or 0.0) + 0.015
                 self.get_logger().warning(
                     f"[exec] 闭爪落空，深度探测 {self.depth_probe_count}/3："
-                    f"creep 停止线 +3cm（累计 +{(self._servo_depth_extra) * 100:.0f}cm）"
+                    f"creep 停止线 +1.5cm（累计 +{(self._servo_depth_extra) * 100:.1f}cm）"
                 )
                 self._publish_grasp_meta(target)
                 self.arm_index = ARM_ACTIONS.index("creep")
@@ -2048,53 +2061,18 @@ class InventoryCompetitionExecutor(Node):
             self._fail_current(f"动作阶段 {action_now} 失败")
             return
         completed_action = ARM_ACTIONS[self.arm_index] if self.arm_index < len(ARM_ACTIONS) else "unknown"
-        last_action = self.arm_worker_action
-        # 伺服重部署序列（backoff_far → slide_up → deploy）
-        if self.servo_redeploy and last_action in ("backoff_far", "slide_up"):
-            if last_action == "backoff_far":
-                self.get_logger().info("[exec] 伺服重部署 1/3：已退离货架 30cm，抬手退出格子")
-                self._spawn_arm("slide_up")
-                return
-            self.servo_redeploy = False
-            self.arm_index = ARM_ACTIONS.index("deploy")
-            self.get_logger().info("[exec] 伺服重部署 2/3：就位，重新 deploy→creep→servo")
-            self._start_arm_action()
-            return
         if completed_action == "servo":
-            # 手眼伺服：只修横向 x。z 由逐类 deploy_offset 校准（抓在罐身上部
-            # 是刻意设计：21cm 高罐的可用夹持带宽，且低位全伸展逼近工作空间
-            # 边界——实测往真值 z 修 7.4cm 后 deploy 关节误差卡 0.23 rad 不
-            # 收敛直到硬超时）。阻尼 0.7 防过冲（实测 +3.7 → 过冲到 -2.0）。
+            # 抓取面手眼微调：worker 内部已用关节1+升降柱直接修正横向/高度
+            # 偏差（creep 前进的航向漂移在这里被闭环），无论收敛与否都闭爪
+            # ——夹空还有深度探测兜底（+3cm → creep → servo → close）。
             correction, measured = self._read_servo_result()
-            cand = target.candidate
-            clamped_dx = max(-0.03, min(0.03, correction[0] * 0.7))
-            # 伸入深度：表观尺寸测距被指头遮挡污染（实测 180px vs 预期 262px），
-            # 不可靠。深度改由"闭爪探测"闭环：夹空 → +3cm → 再 creep → 再闭。
-            lateral_ok = abs(clamped_dx) <= SERVO_APPLY_THRESHOLD
-            need_lateral = measured and not lateral_ok and cand is not None \
-                and cand.world is not None and self.servo_retry < SERVO_RETRY_MAX
-            if need_lateral:
-                self.servo_retry += 1
-                old = cand.world
-                cand.world = (old[0] + clamped_dx, old[1], old[2])
-                self.get_logger().warning(
-                    f"[exec] 手眼伺服：横向偏差 {correction[0] * 100:+.1f}cm"
-                    f"（垂直 {correction[2] * 100:+.1f}cm 忽略，z 由标定 dz 决定），"
-                    f"阻尼修正 {clamped_dx * 100:+.1f}cm，"
-                    f"目标 x {old[0]:.3f} → {cand.world[0]:.3f}，重部署 {self.servo_retry}/{SERVO_RETRY_MAX}"
-                )
-                self._publish_grasp_meta(target)
-                # 重部署序列：先退 30cm 脱离货架前沿，再抬手，再 deploy
-                self.servo_redeploy = True
-                self._spawn_arm("backoff_far")
-                return
             if measured:
                 self.get_logger().info(
-                    f"[exec] 手眼伺服：偏差在阈值内（{correction[0] * 100:+.1f}, "
-                    f"{correction[2] * 100:+.1f})cm，直接闭爪"
+                    f"[exec] 手眼伺服完成：横向累计修正 {correction[0] * 100:+.1f}cm、"
+                    f"高度 {correction[2] * 100:+.1f}cm，闭爪"
                 )
             else:
-                self.get_logger().warning("[exec] 手眼伺服未测得目标，盲闭（不比现状差）")
+                self.get_logger().warning("[exec] 手眼伺服未测得目标，直接闭爪")
         if self.stop_after_close and completed_action == "close_gripper":
             target = self._current()
             if target is not None:
