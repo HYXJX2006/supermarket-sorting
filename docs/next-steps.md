@@ -153,8 +153,35 @@ heading_err 1.57 约 2.6 s），属于货架列对齐的必要动作，不是浪
 本轮实测直接触发 `Conflict. The container name ... is already in use` 把脚本掐死（server 已起、
 client 没起，全程空等）。已补进 `docker rm -f`。
 
-## 5. 建议的下一步（一小时粒度）
+## 5. 三明治（sanmingzhi）抓取实测：夹得住
 
-1. 起一轮 `SUPERMARKET_TASKS=sanmingzhi SUPERMARKET_TASK_COUNT=1`，把 `diag_delivery_freeze.py` 挂进 client 容器 → 拿 P0 的 A/B 结论（这是唯一“不做就永远 0 分”的事）。
-2. 同一轮里顺手用 `grep 'turn-in-place' | wc -l` 统计原地转向次数与总耗时，给 P3 的时间账本一个基线。
-3. 结论出来后：若 A（导航），先修目标判定；若 B（下游），对比 pickup-transit 段的发布者与 QoS，定位覆盖源。
+夹具：`run_item_grasp.sh`（固定布局 `SUPERMARKET_FIXED_BASELINE=1`，强制槽位，绕开 YOLO 与守卫）
+参数：`KIND=sanmingzhi SLOT=E/L1/C1 TARGET_ID=product_037 WORLD="1.585 3.243 0.5484" STOP_AFTER=lift`
+遥测：`debug_data/grasp_evaluation/sanmingzhi_L1_20260912_223146/`（裁判商品侧真值）
+
+| 阶段 | 结果 |
+|---|---|
+| deploy | success（FK 末端误差 0.052 m / 0.046 rad） |
+| creep | success（三轴停止线 `error_xyz=(-0.018, 0.024, 0.007) m`，**一发到位，没走深度探测循环**） |
+| close_gripper | success，**feedback=0.8116**（<0.91 门禁；空夹是 0.99999，夹住苹果 0.8091） |
+| lift | success |
+
+裁判真值（`target_state.jsonl`）：
+
+- 首帧 `z=0.5484`、`xy_shift=0.000`、`gripped=false`
+- 末帧 `z=0.59195`、`xy_shift=0.0043`、`tilt=0.91°`、`gripped=true`
+- **双指接触 `rgt_finger_left_link=true` + `rgt_finger_right_link=true`**
+- 抬升 **+4.36 cm**，全程水平位移最大 **0.6 cm**、倾角最大 **1.39°**，抓后速度 0.0001 m/s（稳定持住）
+
+结论：**物理抓取闭合（几何标定 + 手眼伺服 + 闭爪）对三明治是好的**，不需要重标定。
+09-12 两次三明治/苹果失败都不是“夹不住”，而是**在闭爪之前被近距复核的类别错配守卫否决**：
+模型把 sanmingzhi 认成 kele（离线验证 sanmingzhi 0.86 是对的，实战又混）→ 守卫判“目标位置没有本类”→ 放弃候选。
+即：**卡点 100% 在视觉/守卫，不在手上。**
+
+## 6. 建议的下一步（一小时粒度）
+
+1. 先修近距复核守卫（`_refine_target_before_ik`）：现在 `other_dist` 的最小值算错（`break` 写在内层循环，
+   每条 track 只按第一个样本算）+ 没有置信度门槛 + 目标本类 0 检测时直接判死。改成"取窗口内所有样本的最小距离、
+   加置信度门槛、先换同 kind 的 alternatives 而不是判死"，否则每次视觉一抖就整轮 0 分。
+2. 再补 alternatives 重试：日志里 `alternatives=3` 但失败后既没换候选也没换下一目标，整轮停在 S1。
+3. 然后跑 P0 的 `/cmd_vel` 冻结二分诊断——S4/S5 的分还是 0。
