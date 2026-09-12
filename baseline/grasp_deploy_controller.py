@@ -96,7 +96,7 @@ class DeployController(Node):
         self._reached_stable_cycles = 0
         self._deploy_ramp_started_at: float | None = None
         # top 模式 ramp 含悬停中间路点，时长翻倍（先上后下各 3s）
-        self._deploy_ramp_seconds = 6.0 if _GRASP_ROT_MODE == "top" else 3.0
+        self._deploy_ramp_seconds = 6.0 if _GRASP_ROT_MODE == "top" else 1.5   # 比赛提速
         self._deploy_ramp_start: dict | None = None
 
         self.spine_pub = self.create_publisher(Float64MultiArray, SPINE_TOPIC, 10)

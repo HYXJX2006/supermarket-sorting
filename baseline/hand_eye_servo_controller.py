@@ -170,13 +170,22 @@ class HandEyeServo(Node):
         best_dist = 1e9
         for index in range(1, count):
             area = int(stats[index, cv2.CC_STAT_AREA])
-            if area < max(300, h * w * 0.002):
+            if area < max(1500, h * w * 0.004):
+                continue
+            bw = float(stats[index, cv2.CC_STAT_WIDTH])
+            bh = float(stats[index, cv2.CC_STAT_HEIGHT])
+            # 形状过滤：目标罐是大块团（宽高比适中）；货架红条是细长条
+            # （一条边远大于另一条）——实测红条混入会让伺服量到货架上去
+            if min(bw, bh) < 60:
+                continue
+            aspect = max(bw, bh) / max(1.0, min(bw, bh))
+            if aspect > 2.5:
                 continue
             u, v = centroids[index]
             dist = math.hypot(u - cx_img, (v - cy_img) * 0.5)  # 横向优先
             if dist < best_dist:
                 best_dist = dist
-                best = (float(u), float(v), float(stats[index, cv2.CC_STAT_WIDTH]))
+                best = (float(u), float(v), bw)
         return best
 
     # ---------- main ----------
@@ -265,10 +274,10 @@ class HandEyeServo(Node):
                 sens = (wx3 - wx0) / h   # world x per j3 rad
             except Exception:
                 sens = 0.0
-            if abs(sens) < 0.05:
-                result["reason"] = f"j3 横向灵敏度过低（{sens:.3f}），无法修正"
-                break
-            dj3 = max(-0.15, min(0.15, err_lateral / sens))
+            # 修正方向/幅度用实测标定：dj3=+0.15 时误差 +6cm（数值 FK 预言
+            # +x 方向与实际相反）→ 经验灵敏度 -0.4 m/rad，dj3 = -err/0.4
+            dj3 = max(-0.15, min(0.15, -err_lateral / 0.4))
+            sens = -0.4
             if abs(dj3) < 1e-3:
                 continue
             arm_msg = Float64MultiArray()

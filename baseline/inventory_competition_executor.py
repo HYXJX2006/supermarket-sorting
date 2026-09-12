@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -165,10 +165,11 @@ TRACK_STABILITY_WINDOW = max(6, _env_int("SUPERMARKET_TRACK_STABILITY_WINDOW", 8
 # 这些 worker 只控制机械臂/夹爪/升降柱，不控底盘；底盘由本 executor 独占。
 # servo：creep 到位后、闭爪前的手眼伺服——测"手指-商品"横向/高度偏差，
 # 超阈值则回退重部署（复用 creep-retry 的 backoff→deploy→creep 通道）。
-# 动作顺序：降到同高（deploy）→ 进深（creep）→ 抓取面手眼微调（servo：
-# 测"手指-商品"横向/高度偏差，直接调关节1+升降柱修正 creep 前进漂移，
-# 不重部署）→ 闭爪（夹空则 +3cm 深度探测再 creep→servo→close）。
-ARM_ACTIONS = ("safe_pose", "deploy", "creep", "servo", "close_gripper", "lift", "retreat", "slide_reset")
+# 动作顺序（主人的分阶段方案，两处校准）：
+#   deploy 降到同高 → servo① 左右校准（罐子完整可见，防止进深时指头顶歪
+#   罐子——实测罐子被顶成 57-68° 斜躺后无法抓取）→ creep 进深 → servo②
+#   抓取面微调（修正进深漂移）→ close（夹空则 +1.5cm 深度探测再循环）。
+ARM_ACTIONS = ("safe_pose", "deploy", "servo", "creep", "servo", "close_gripper", "lift", "retreat", "slide_reset")
 POST_PLACE_SAFE_POSE = "post_place_safe_pose"
 # 手眼伺服：偏差超过 SERVO_APPLY_THRESHOLD 则带修正量回退重部署；
 # 最多 SERVO_RETRY_MAX 次（每次部署 ~20s，比赛时限内可承受）。
@@ -269,6 +270,14 @@ class InventoryCompetitionExecutor(Node):
         self.servo_redeploy = False   # 伺服重部署序列：slide_up → backoff → deploy
         self._servo_depth_extra = 0.0  # 伸入深度修正（只进 creep 停止线）
         self.depth_probe_count = 0     # 闭爪落空后的深度探测计数
+        # 配送段卡死检测：位置 12s 不动（车楔在障碍物角上，正前方激光
+        # 看不见侧向接触）→ 杀导航 → 倒车 2s → 重新驱动
+        self._deliver_last_pos: tuple[float, float] | None = None
+        self._deliver_last_t: float = 0.0
+        self._deliver_stall_s: float = 0.0
+        self._deliver_reversing = False
+        self._deliver_reverse_until = 0.0
+        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self._servo_standoff = 0.0
         self.consecutive_failures = 0
         self.recovering_from_failure = False
@@ -2232,6 +2241,43 @@ class InventoryCompetitionExecutor(Node):
                 and now - self.deliver_started_at > DELIVER_NAV_TIMEOUT
             ):
                 self._fail_current("配送导航超时")
+                return
+            # 卡死检测与倒车重试：车楔在障碍物角上时正前方激光畅通，
+            # 避障不触发，但位置 12s 不动 → 倒车 2s 脱困后重新驱动
+            if self.x is not None and self.y is not None:
+                if self._deliver_last_pos is not None:
+                    moved = math.hypot(
+                        self.x - self._deliver_last_pos[0],
+                        self.y - self._deliver_last_pos[1],
+                    )
+                    if moved < 0.03:
+                        self._deliver_stall_s += now - self._deliver_last_t
+                    else:
+                        self._deliver_stall_s = 0.0
+                self._deliver_last_pos = (self.x, self.y)
+                self._deliver_last_t = now
+            if self._deliver_reversing:
+                if now < self._deliver_reverse_until:
+                    twist = Twist()
+                    twist.linear.x = -0.12
+                    self.cmd_vel_pub.publish(twist)
+                else:
+                    self._deliver_reversing = False
+                    self._deliver_stall_s = 0.0
+                    self.get_logger().info("[exec] 倒车脱困完成，重新驱动配送")
+                    if self.goal is not None:
+                        self._publish_goal_msg(*self.goal)
+                        self._ensure_nav(
+                            min(self.cruise_max_speed, DELIVERY_SPEED) if hasattr(self, "cruise_max_speed") else 0.6
+                        )
+                return
+            if self._deliver_stall_s > 10.0:
+                self._deliver_reversing = True
+                self._deliver_reverse_until = now + 2.0
+                self._stop_worker_process(self.nav_worker)
+                self.nav_worker = None
+                self.get_logger().warning("[exec] 配送段卡死（位置 12s 不动）：杀导航，倒车 2s 脱困")
+                return
         elif self.phase == "place":
             self._place_tick()
         elif self.phase == "post_place_safe_pose":
