@@ -285,7 +285,11 @@ class HandEyeServo(Node):
             # 唯一实测收敛过的档位（09-12 白天：3.3cm → -1.2cm）。
             # 若再出现发散，别再调增益，改查团块中心是否追错目标
             # （本轮 servo_result 里 u 从 689→756→833 px 一路右移，疑似团块在漂）。
-            dj3 = max(-0.08, min(0.08, -err_lateral / 0.4 * 0.5))
+            # 等效增益 = SERVO_LATERAL_GAIN（现场可调，默认 1.25 = 历史唯一
+            # 收敛过的档位）。注意：>1 的名义增益在团块稳定时也能收敛
+            # （每次误差乘以 |1-G|），真正致命的是团块在漂。
+            lateral_gain = float(os.getenv("SUPERMARKET_SERVO_LATERAL_GAIN", "1.25"))
+            dj3 = max(-0.08, min(0.08, -err_lateral * lateral_gain))
             sens = -0.4
             if abs(dj3) < 1e-3:
                 continue

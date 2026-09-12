@@ -33,9 +33,21 @@ echo "viewer: http://localhost:8090/  (容器 viewer_stream)"
 
 : > "$LOG"
 cd "$ROOT" || exit 1
-SUPERMARKET_TASKS="$TASKS" SUPERMARKET_TASK_COUNT="$COUNT" SUPERMARKET_SEED="$SEED" \
+# 现场可调旋钮（主人边看 8090 边改）：
+#   GRASP_Z_OFFSET      抓取高度偏置，m，负=压低（默认 -0.02）
+#   SERVO_LATERAL_GAIN  手眼横向伺服比例增益（默认 1.25，历史收敛档）
+#   SERVO_MAX_ITER      横向迭代上限（默认沿用 worker 自身参数）
+GRASP_Z_OFFSET="${GRASP_Z_OFFSET:-}"
+SERVO_LATERAL_GAIN="${SERVO_LATERAL_GAIN:-}"
+EXTRA_ENV=()
+[ -n "$GRASP_Z_OFFSET" ] && EXTRA_ENV+=("SUPERMARKET_GRASP_Z_OFFSET_M=$GRASP_Z_OFFSET")
+[ -n "$SERVO_LATERAL_GAIN" ] && EXTRA_ENV+=("SUPERMARKET_SERVO_LATERAL_GAIN=$SERVO_LATERAL_GAIN")
+
+env SUPERMARKET_TASKS="$TASKS" SUPERMARKET_TASK_COUNT="$COUNT" SUPERMARKET_SEED="$SEED" \
+  "${EXTRA_ENV[@]}" \
   setsid nohup bash "$SCRIPT" >> "$LOG" 2>&1 < /dev/null &
 echo "launched pid=$! tasks=$TASKS count=$COUNT seed=$SEED log=$LOG"
+echo "旋钮: GRASP_Z_OFFSET=${GRASP_Z_OFFSET:-默认-0.02}  SERVO_LATERAL_GAIN=${SERVO_LATERAL_GAIN:-默认}"
 sleep 3
 echo "--- 日志开头 ---"
 head -n 5 "$LOG" 2>/dev/null || echo "(日志尚未生成)"

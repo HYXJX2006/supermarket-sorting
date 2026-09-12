@@ -145,6 +145,12 @@ MIN_CANDIDATE_CONFIDENCE = _env_float("SUPERMARKET_MIN_CANDIDATE_CONFIDENCE", 0.
 # 抬到 1.002 → 部署 EE 高度比罐身上沿还高 4cm → 闭爪 4 次全落空（feedback 0.08~0.10）。
 # 这里把层高当硬约束，视觉 z 只允许在 ±Z_LEVEL_CLAMP_M 内做微调。
 Z_LEVEL_CLAMP_M = _env_float("SUPERMARKET_Z_LEVEL_CLAMP_M", 0.025)
+# 抓取高度偏置：现场可调的"整体压低/抬高"旋钮（m，负值=压低）。
+# 背景：deploy 的 z 直接取视觉 z，而视觉 z 逐层偏高（本轮地图 L1 中位 0.595 /
+# L2 0.953 / L3 1.251，真值 0.55/0.90/1.23），叠加**垂直修正代码根本不存在**
+# （servo 只写 j3，结果里 height 恒为 +0.0cm），于是指头停在商品上方悬空
+# （主人目视确认）。这里把高度钉在"该货位层高 LEVEL_Z + 偏置"上，视觉 z 只当参考。
+GRASP_Z_OFFSET_M = _env_float("SUPERMARKET_GRASP_Z_OFFSET_M", -0.02)
 # 跳巡游扫描：比赛时限 420s，而 E→D→C→B→A 全扫描实测要 5-8 分钟。
 # 任务清单（目标 kind）与 45 槽位布局都是已知的，可直接用布局真值预填地图
 # 并立即进入执行阶段，把扫描时间全部省掉。
@@ -1882,16 +1888,21 @@ class InventoryCompetitionExecutor(Node):
             )
             return
         clamped = refined
-        level_z = LEVEL_Z.get(int(getattr(cand, "level", 0) or 0))
-        if Z_LEVEL_CLAMP_M > 0.0 and level_z is not None:
+        level = int(getattr(cand, "level", 0) or 0)
+        level_z = LEVEL_Z.get(level)
+        if level_z is not None:
+            # 层高已知（固定布局真值），视觉 z 只允许在 band 内微调，再叠加
+            # 现场偏置——高度误差在这种小物体上是致命的（悬空/顶板）。
             lo, hi = level_z - Z_LEVEL_CLAMP_M, level_z + Z_LEVEL_CLAMP_M
-            if refined[2] < lo or refined[2] > hi:
-                clamped = (refined[0], refined[1], min(hi, max(lo, refined[2])))
+            base_z = min(hi, max(lo, refined[2]))
+            target_z = base_z + GRASP_Z_OFFSET_M
+            if abs(target_z - refined[2]) > 1e-4:
                 self.get_logger().warning(
-                    f"[exec] 近距复核：{kind} 高度 z={refined[2]:.3f} 超出货位 "
-                    f"{cand.slot} 层高 {level_z:.2f}±{Z_LEVEL_CLAMP_M:.3f}，"
-                    f"夹到 {clamped[2]:.3f}"
+                    f"[exec] 近距复核：{kind} 高度 z={refined[2]:.3f} → 层高锚定 "
+                    f"L{level}={level_z:.2f}±{Z_LEVEL_CLAMP_M:.3f} "
+                    f"偏置{GRASP_Z_OFFSET_M*100:+.1f}cm → {target_z:.3f}"
                 )
+            clamped = (refined[0], refined[1], target_z)
         cand.world = clamped
         self.get_logger().info(
             f"[exec] 近距复核：{kind} 目标 "
