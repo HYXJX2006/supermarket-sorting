@@ -291,6 +291,13 @@ class InventoryCompetitionExecutor(Node):
         self.creep_retry = 0
         self.servo_retry = 0
         self.servo_redeploy = False   # 伺服重部署序列：slide_up → backoff → deploy
+        # 伺服高度闭环：伺服测到的竖直残差 → 累加到候选 z → 回退重部署再测，
+        # 最多 SERVO_RETRY_MAX 次。历史上 correction[2] 恒为 0（worker 只写
+        # 横向 j3），所以这套重部署机制从来没被触发过——垂直方向等于开环，
+        # 实测指头停在商品上方悬空（servo 自己测出来的 vertical 是 -10cm）。
+        self._servo_pending_dz = 0.0
+        self._servo_redeploy_step = 0
+        self._servo_height_retry = 0
         self._servo_depth_extra = 0.0  # 伸入深度修正（只进 creep 停止线）
         self.depth_probe_count = 0     # 闭爪落空后的深度探测计数
         # 配送段卡死检测：位置 12s 不动（车楔在障碍物角上，正前方激光
@@ -1071,6 +1078,83 @@ class InventoryCompetitionExecutor(Node):
             self.nav_worker = None
         if self.nav_worker is None:
             self._spawn_nav(speed, pickup, pickup_transit)
+
+    def _apply_pending_vertical_correction(self, cand: object) -> None:
+        """把伺服闭环待定的高度修正量加到候选 z（负=压低）。"""
+        if abs(self._servo_pending_dz) < 1e-6:
+            return
+        world = getattr(cand, "world", None)
+        if not world:
+            return
+        cand.world = (
+            float(world[0]),
+            float(world[1]),
+            float(world[2]) + float(self._servo_pending_dz),
+        )
+        self.get_logger().warning(
+            f"[exec] 高度闭环：应用伺服残差 {self._servo_pending_dz * 100:+.1f}cm，"
+            f"目标 z → {cand.world[2]:.3f}"
+        )
+        self._servo_pending_dz = 0.0
+
+    def _note_servo_height_error(self, measured: bool) -> bool:
+        """消费伺服测到的竖直残差；需要重部署时返回 True。"""
+        if not measured:
+            return False
+        try:
+            payload = json.loads(
+                (self.baseline_dir / SERVO_RESULT_PATH).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return False
+        iterations = payload.get("iterations") or []
+        if not iterations:
+            return False
+        last = iterations[-1]
+        if "vertical_err_m" not in last:
+            return False
+        err_v = float(last["vertical_err_m"])
+        if abs(err_v) <= SERVO_APPLY_THRESHOLD:
+            self.get_logger().info(
+                f"[exec] 高度闭环：伺服竖直残差 {err_v * 100:+.1f}cm 在门限内"
+            )
+            return False
+        if self._servo_height_retry >= SERVO_RETRY_MAX:
+            self.get_logger().warning(
+                f"[exec] 高度闭环：重部署已达上限 {SERVO_RETRY_MAX} 次，"
+                f"剩余竖直残差 {err_v * 100:+.1f}cm，继续闭爪"
+            )
+            return False
+        self._servo_height_retry += 1
+        self._servo_pending_dz = max(-0.08, min(0.08, -err_v))
+        self.get_logger().warning(
+            f"[exec] 高度闭环：伺服竖直残差 {err_v * 100:+.1f}cm → 目标 z "
+            f"{self._servo_pending_dz * 100:+.1f}cm，退开重部署后复测"
+            f"（{self._servo_height_retry}/{SERVO_RETRY_MAX}）"
+        )
+        return True
+
+    def _begin_servo_redeploy(self) -> None:
+        """带高度修正的回退重部署：退远 → 抬手 → 重部署（格内先抬手会刮层板）。"""
+        self._servo_redeploy_step = 1
+        self._spawn_arm("backoff_far")
+
+    def _servo_redeploy_tick(self) -> None:
+        step = self._servo_redeploy_step
+        if step == 1:
+            self._spawn_arm("slide_up")
+            self._servo_redeploy_step = 2
+        elif step == 2:
+            self._spawn_arm("deploy")
+            self._servo_redeploy_step = 3
+        elif step == 3:
+            self._spawn_arm("creep")
+            self._servo_redeploy_step = 4
+        elif step == 4:
+            self._spawn_arm("servo")
+            self._servo_redeploy_step = 5
+        else:
+            self._servo_redeploy_step = 0
 
     def _read_servo_result(self) -> tuple[tuple[float, float, float], bool]:
         """读手眼伺服结果文件；缺文件/超时（>60s 旧）视为未测量。"""
@@ -1865,6 +1949,8 @@ class InventoryCompetitionExecutor(Node):
                 f"沿用扫描期坐标（仅补偿 y 系统偏差 +{DETECTION_Y_BIAS * 100:.0f}cm）"
             )
             cand.world = (old[0], old[1] + DETECTION_Y_BIAS, old[2])
+            # 伺服测出的高度残差在这里补上（视觉 z 不可信时，伺服是唯一真值）
+            self._apply_pending_vertical_correction(cand)
             return
         old = cand.world
         refined = tuple(
@@ -1904,6 +1990,7 @@ class InventoryCompetitionExecutor(Node):
                 )
             clamped = (refined[0], refined[1], target_z)
         cand.world = clamped
+        self._apply_pending_vertical_correction(cand)
         self.get_logger().info(
             f"[exec] 近距复核：{kind} 目标 "
             f"({old[0]:.3f},{old[1]:.3f},{old[2]:.3f}) → "
@@ -2212,6 +2299,11 @@ class InventoryCompetitionExecutor(Node):
             self._fail_current(f"动作阶段 {action_now} 失败")
             return
         completed_action = ARM_ACTIONS[self.arm_index] if self.arm_index < len(ARM_ACTIONS) else "unknown"
+        if self._servo_redeploy_step:
+            # 重部署序列进行中：退远→抬手→重部署→creep→servo，结束后回到闭爪
+            self._servo_redeploy_tick()
+            if self._servo_redeploy_step:
+                return
         if completed_action == "servo":
             # 抓取面手眼微调：worker 内部已用关节1+升降柱直接修正横向/高度
             # 偏差（creep 前进的航向漂移在这里被闭环），无论收敛与否都闭爪
@@ -2224,6 +2316,11 @@ class InventoryCompetitionExecutor(Node):
                 )
             else:
                 self.get_logger().warning("[exec] 手眼伺服未测得目标，直接闭爪")
+            # 垂直方向闭环：伺服是高度唯一可信来源（视觉 z 逐层偏高）。
+            # 残差超门限 → 把修正量挂到候选 z 上，退开重部署再测。
+            if self._note_servo_height_error(measured):
+                self._begin_servo_redeploy()
+                return
         if self.stop_after_close and completed_action == "close_gripper":
             target = self._current()
             if target is not None:
