@@ -1442,22 +1442,25 @@ class InventoryCompetitionExecutor(Node):
                 goals.append((x, observe_y, observe_yaw, False, speed, True))
                 self.drive_goals = goals
         else:
-            # The formal random-obstacle layout places a physical corridor
-            # boundary across the direct start-to-shelf line. The old route
-            # drove at x~=1.9 and stopped at the south board while pickup-
-            # transit intentionally ignored LaserScan. Use the clear east-side
-            # bypass first, then enter the shelf row and the pickup line.
-            bypass_x = float(os.getenv("SUPERMARKET_FORMAL_PICKUP_BYPASS_X", "1.70"))
+            # 先从走廊直接 +Y 进入观察区：这一段是出生点到观察行的同轴
+            # 直线，天然无遮挡。扫描/目标导航都为 pickup-transit，本身
+            # 忽略货架雷达障碍，所以横向绕行必须放在观察行（北侧）里做，
+            # 不能在走廊里横着蹭南侧挡板——旧路线写死 x=1.70 时正是
+            # "先西移 22cm 再北上"，既多一次 90° 原地转向又贴板。
             start_x = float(self.x if self.x is not None else 1.92)
             start_y = float(self.y if self.y is not None else -3.17)
-            lateral_to_bypass_yaw = 0.0 if bypass_x >= start_x else math.pi
+            # 首段横移线直接取当前 odom 的 x：车出生朝 +Y，第一段也朝 +Y，
+            # 起步无需原地转向。此前写死 1.70 时，起点 x=1.92 只有 22cm 的
+            # 横向差，却要先原地左转约 90°（--max-angular 0.45 → 3.5s 起），
+            # 转向切直行附近前进速度非零还会沿弧线漂出"左走一点"。
+            # 现在起点 x 与第一航点 x 相同，第一次转向只剩最后一段的收尾对正。
+            bypass_x = start_x
             lateral_to_shelf_yaw = math.pi if x <= bypass_x else 0.0
             self.drive_goals = [
-                # 首次进入 E 货架的四段都按确定的轴向运动执行：
-                # 横向绕行 → +Y 进入观察区 → 横向到货架列 → +Y 到观察线。
+                # 首次进入 E 货架的三段都按确定的轴向运动执行：
+                # +Y 进入观察区 → 横向到货架列 → +Y 到观察线。
                 # 最后一段不能使用 pickup-approach，否则会把扫描路线
                 # 当成目标取货接近段，出现反向跑离观察线的问题。
-                (bypass_x, start_y, lateral_to_bypass_yaw, False, speed, True),
                 (bypass_x, 1.90, math.pi / 2.0, False, speed, True),
                 (x, 1.90, lateral_to_shelf_yaw, False, speed, True),
                 (x, observe_y, math.pi / 2.0, False, speed, True),

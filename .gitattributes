@@ -1,0 +1,18 @@
+# 统一行尾，防止 Windows core.autocrlf=true 把 shell/python 还原成 CRLF。
+# 血泪教训：git restore 后 *.sh 变 CRLF → `set -euo pipefail\r` → dash 报
+# "pipefail: invalid option name"，容器根本没起来，脚本秒退。
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.bash text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.txt text eol=lf
+*.xml text eol=lf
+*.pt binary
+*.jpg binary
+*.png binary
+*.tar binary
+*.bag binary

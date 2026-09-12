@@ -105,7 +105,9 @@ unset SUPERMARKET_FIXED_BASELINE SUPERMARKET_FIXED_TARGET_SLOT \
   SUPERMARKET_FIXED_TARGET_WORLD SUPERMARKET_FIXED_TARGET_WORLD_TOLERANCE || true
 
 echo "==> 清理旧容器"
-docker rm -f "$SERVER_NAME" "$CLIENT_NAME" >/dev/null 2>&1 || true
+# 必须连裁判遥测容器一起清：漏了它会以 "container name already in use"
+# 直接掐死脚本（本轮实测踩到），而 server 已经起来了 → 后面全空等。
+docker rm -f "$SERVER_NAME" "$CLIENT_NAME" "${SERVER_NAME}_telem" >/dev/null 2>&1 || true
 
 echo "# 容器 Python 是 3.10，会优先读 baseline/__pycache__/*.cpython-310.pyc。
 # :ro 挂载只阻止写新缓存，不阻止读旧缓存；源码改了而 .pyc 陈旧时会静默用旧
