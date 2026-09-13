@@ -14,6 +14,12 @@ WEIGHTS="${MULTICLASS_WEIGHTS:-/workspace/baseline/debug_data/multiclass_train_v
 CONF="${SUPERMARKET_DETECTION_CONFIDENCE:-0.15}"
 ARUCO_SCRIPT="$BASELINE/official_baseline/examples/supermarket_sorting/perception/aruco_detect.py"
 
+# ROS 的 setup.bash 会读 AMENT_TRACE_SETUP_FILES / COLCON_TRACE 等变量；
+# 在 set -u 下它们是"未定义变量" → setup.bash 第 8 行直接报 unbound variable
+# 退出（实测：脚本一 source 就死，ArUco/编排器根本没启动）。
+export AMENT_TRACE_SETUP_FILES="${AMENT_TRACE_SETUP_FILES:-}"
+export COLCON_TRACE="${COLCON_TRACE:-}"
+export AMENT_PYTHON_EXECUTABLE="${AMENT_PYTHON_EXECUTABLE:-}"
 source /opt/ros/humble/setup.bash
 
 echo "==> [client] 启动 YOLO 多类检测器"
