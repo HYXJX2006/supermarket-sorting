@@ -32,6 +32,20 @@ from inventory_map import LEVEL_Z, SHELF_ORDER_FOR_ROUTE, SLOT_X, InventoryEntry
 from shelf_map import slot_from_aruco
 
 
+ARUCO_ID_BY_LABEL: dict[str, int] = {}
+
+
+def _build_aruco_reverse_map() -> None:
+    for aruco_id in range(45):
+        try:
+            ARUCO_ID_BY_LABEL[slot_from_aruco(aruco_id).label] = aruco_id
+        except Exception:
+            continue
+
+
+_build_aruco_reverse_map()
+
+
 def aruco_slot_world(aruco_id: int) -> tuple[float, float, float]:
     """ArUco ID → 货位名义世界坐标（布局真值：列间距/层高都是固定的）。"""
     slot = slot_from_aruco(int(aruco_id))
@@ -176,7 +190,7 @@ GRASP_Z_OFFSET_M = _env_float("SUPERMARKET_GRASP_Z_OFFSET_M", -0.02)
 # 背景：主人实测每次抓取机械臂都向左偏 4~5cm，而手眼伺服的横向 j3 修正
 # 已被证明不可靠（同帧重复、残差 ±2.6cm 纹丝不动、两档增益都发散），
 # 所以横向改走"开环偏置补偿"这条确定的路径：直接把目标 x 平移。
-ARM_LATERAL_OFFSET_M = _env_float("SUPERMARKET_ARM_LATERAL_OFFSET_M", -0.06)
+ARM_LATERAL_OFFSET_M = _env_float("SUPERMARKET_ARM_LATERAL_OFFSET_M", 0.0)   # 09-13 归零：与吸附/伺服叠加互相打架（实测 -0.630 吸附后被拖回 -0.690）
 # 跳巡游扫描：比赛时限 420s，而 E→D→C→B→A 全扫描实测要 5-8 分钟。
 # 任务清单（目标 kind）与 45 槽位布局都是已知的，可直接用布局真值预填地图
 # 并立即进入执行阶段，把扫描时间全部省掉。
@@ -443,6 +457,10 @@ class InventoryCompetitionExecutor(Node):
         self.grasp_meta_pub = self.create_publisher(String, GRASP_META_TOPIC, NAV_QOS)
         self.aruco_ids: tuple[int, ...] = ()
         self.aruco_seen_at = 0.0
+        # 逐 ID 闩锁：检测器频繁发布空帧（[] 与 [17] 交替），用"最近一帧"
+        # 判定可见性会随机丢码——吸附在复核瞬间恰逢空帧就静默跳过
+        # （实测 7cm 目标偏差漏过吸附）。3 秒内见过该码即视为可见。
+        self.aruco_seen_ts: dict[int, float] = {}
         self.head_pub = self.create_publisher(Float64MultiArray, HEAD_CMD_TOPIC, 10)
         self.create_timer(0.1, self._tick)
         self.get_logger().warning(
@@ -848,6 +866,14 @@ class InventoryCompetitionExecutor(Node):
         pose.pose.orientation.z = math.sin(gyaw / 2.0)
         pose.pose.orientation.w = math.cos(gyaw / 2.0)
         self.nav_goal_pub.publish(pose)
+        # 头部俯仰在导航出发时就对准目标层（09-13 定案）：扫描结束时头
+        # 停在任意俯仰，等到预抓取线才转头会错过复核采样窗口；提前转向
+        # 则到位时头部已稳定对着目标层。
+        level_pitch = {1: PITCH_SCAN[2][0], 2: PITCH_SCAN[1][0], 3: PITCH_SCAN[0][0]}.get(
+            getattr(target.candidate, "level", None)
+        )
+        if level_pitch is not None:
+            self._head(level_pitch)
         if target.status == "searching":
             target.status = "navigating"
         meta = String(data=json.dumps({"schema_version": 1, "mode": "inventory_coordinator", "target_id": target.target_id, "kind": target.kind, "slot": target.candidate.slot, "object_world": target.candidate.world, "navigation_goal": [gx, gy, gyaw]}, ensure_ascii=False, separators=(",", ":")))
@@ -1053,7 +1079,8 @@ class InventoryCompetitionExecutor(Node):
         # 配送段的航点已由同种子障碍布局 A* 生成；降低局部绕行阈值，
         # 避免雷达的保守安全航向把底盘从可行航线拉成小圈。仍保留
         # 正面近障停车，只放宽到与 A* 的机器人膨胀半径一致。
-        nav_obstacle_distance = min(self.obstacle_distance, 0.35) if planned_delivery else self.obstacle_distance
+        # 配送段 0.45：更早打方向给手臂留余量（0.35 时贴障行走）
+        nav_obstacle_distance = min(self.obstacle_distance, 0.45) if planned_delivery else self.obstacle_distance
         nav_avoid_clearance = 0.30 if planned_delivery else 0.55
         nav_goal_tolerance = (
             0.18
@@ -1133,6 +1160,9 @@ class InventoryCompetitionExecutor(Node):
                 )
             )
         self.aruco_seen_at = time.monotonic()
+        now = time.monotonic()
+        for aruco_id in ids:
+            self.aruco_seen_ts[aruco_id] = now
 
     def _apply_aruco_slot_snap(self, cand: object) -> None:
         """把候选的 x/z 吸附到 ArUco 所指货位的名义坐标（布局真值）。
@@ -1144,21 +1174,23 @@ class InventoryCompetitionExecutor(Node):
             否则只告警不动手（防止把目标拉到错误货位）；
           - y 保持视觉值：深度是进深方向的唯一来源。
         """
-        if not USE_ARUCO_SLOT or not self.aruco_ids:
+        if not USE_ARUCO_SLOT:
             return
+        # 名义坐标来自货位标签（固定货架几何：列间距/层高），不依赖 ArUco
+        # 检测——检测器极度稀疏（整轮只见 17/38，目标槽位的码可能一帧都
+        # 检不到），硬性要求"见过码"会让吸附形同虚设（实测 7cm x 偏漏过）。
+        # 码的可见性降级为日志确认；8cm 容差守卫保留（视觉差超容差仍拒绝
+        # 吸附，防止把目标拖到错误货位）。
         world = getattr(cand, "world", None)
         if not world:
             return
         slot = str(getattr(cand, "slot", "") or "")
         if not slot:
             return
-        expected_id = getattr(cand, "aruco_id", None)
-        if expected_id is None or int(expected_id) not in self.aruco_ids:
-            self.get_logger().info(
-                f"[exec] ArUco：候选 {slot} 的码 {expected_id} 不在可见列表 "
-                f"{list(self.aruco_ids)}，不吸附（沿用视觉坐标）"
-            )
+        expected_id = ARUCO_ID_BY_LABEL.get(slot)
+        if expected_id is None:
             return
+        marker_seen = self.aruco_seen_ts.get(expected_id) is not None
         nominal = aruco_slot_world(int(expected_id))
         dx = abs(float(world[0]) - nominal[0])
         dz = abs(float(world[2]) - nominal[2])
@@ -1171,6 +1203,7 @@ class InventoryCompetitionExecutor(Node):
             )
             return
         new_world = (nominal[0], float(world[1]), nominal[2])
+        _ = marker_seen  # 码可见性仅入日志（检测稀疏，不作硬性条件）
         self.get_logger().warning(
             f"[exec] ArUco 吸附：{slot} (码 {int(expected_id)}) "
             f"x/z {float(world[0]):.3f}/{float(world[2]):.3f} → "
@@ -1439,7 +1472,13 @@ class InventoryCompetitionExecutor(Node):
             origin_x, origin_y = -0.96, -1.01
             start = (start_world[0] - origin_x, start_world[1] - origin_y)
             goal = (goal_world[0] - origin_x, goal_world[1] - origin_y)
-            radius = float(layout.ROBOT_CLEARANCE_RADIUS)
+            # 膨胀 1.35（0.47m）：障碍生成已改为靠墙（生成器 wall-hug 偏置
+            # + server 同步挂载），走廊中央天然宽敞；膨胀过大（1.7）会让
+            # 靠墙障碍与墙间无可行格，A* 直接失败（实测）。SUPERMARKET_
+            # NAV_INFLATE 可调。
+            radius = float(layout.ROBOT_CLEARANCE_RADIUS) * _env_float(
+                "SUPERMARKET_NAV_INFLATE", "1.35"
+            )
             resolution = float(layout.GRID_RESOLUTION)
             x_min = float(layout.CORRIDOR_X_MIN) + radius
             x_max = float(layout.CORRIDOR_X_MAX) - radius
@@ -2068,13 +2107,15 @@ class InventoryCompetitionExecutor(Node):
         # y 系统偏差补偿：检测深度系统性偏近（见 DETECTION_Y_BIAS 注释）
         refined = (refined[0], refined[1] + DETECTION_Y_BIAS, refined[2])
         drift = math.dist(refined, old)
-        if drift > 0.15:
-            # 修正幅度过大 = 大概率追错了目标（弱聚类/误检的近距确认），
-            # 弃用本次修正保留原坐标——26cm 级的"修正"曾把目标拉到
-            # 错误货架导致 IK 不可达（实测）
+        # 修正上限按证据强度分级：弱聚类（<12 样本）15cm——防追错目标
+        # （4 样本追 26cm 到错误货架的教训）；强聚类（>=12 样本）35cm——
+        # 扫描期红色系误认（三明治被认成薯片）会让声明货位整段偏离，
+        # 强证据应当允许大修正（实测 25 样本 / 30cm 被 15cm 上限卡死）
+        drift_cap = 0.35 if len(samples) >= 12 else 0.15
+        if drift > drift_cap:
             self.get_logger().warning(
-                f"[exec] 近距复核：{kind} 修正 {drift * 100:.0f}cm 超过 15cm 上限，"
-                f"疑似追错目标，弃用（{len(samples)} 样本）"
+                f"[exec] 近距复核：{kind} 修正 {drift * 100:.0f}cm 超过上限 "
+                f"{drift_cap * 100:.0f}cm（{len(samples)} 样本），疑似追错目标，弃用"
             )
             return
         if drift <= 0.005:

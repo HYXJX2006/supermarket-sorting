@@ -41,7 +41,7 @@ if [[ "$STOP_AFTER_CLOSE" == "1" ]]; then
   STOP_AFTER_CLOSE_ARG=" --stop-after-close"
 fi
 GRIP_THRESHOLD="${SUPERMARKET_GRIP_CLOSED_FEEDBACK_MAX:-0.85}"
-SHUPIAN_CREEP_STOP_DY="${SUPERMARKET_SHUPIAN_CREEP_STOP_DY:--0.010}"
+SHUPIAN_CREEP_STOP_DY="${SUPERMARKET_SHUPIAN_CREEP_STOP_DY:-0.010}"
 SHUPIAN_CREEP_Y_TOL="${SUPERMARKET_SHUPIAN_CREEP_Y_TOL:-0.025}"
 HEADLESS="${SUPERMARKET_HEADLESS:-0}"      # 0=显示 X11 窗口
 USE_GS="${SUPERMARKET_USE_GS:-1}"   # 1=3DGS 渲染（走 GS 管线，绕开崩过的原生 mjr_render）；相机图像可用          # 1=3DGS实时画面；0=MuJoCo native
@@ -70,7 +70,7 @@ MAP_CONFIDENCE="${SUPERMARKET_MAP_CONFIDENCE:-0.25}"
 # 启动前需在 Windows 侧运行 start_x.bat（VcXsrv :1 + 防火墙规则）。
 X11_DISPLAY="${X11_DISPLAY:-172.25.192.1:1}"
 SERVER_NAME="random5_autopilot_server"
-CLIENT_NAME="random5_autopilot_client"
+CLIENT_NAME="random5_dbg_client"
 
 # 检测权重：默认使用 v6（v4 + 手眼伺服时代的混淆专项微调，修复
 # chengzi/kouxiangtang/maidong 分类混淆）；v4 为回退。仍可通过
@@ -158,7 +158,6 @@ docker run -d --name "$SERVER_NAME" --gpus all --network host --ipc host \
   -v "$ROOT/baseline:/workspace/baseline:ro" \
   -v "$ROOT/baseline/patches/discoverse/envs/simulator.py:/workspace/supermarket_sorting_task/discoverse/envs/simulator.py:ro" \
   -v "$ROOT/baseline/patches/examples/ros2/mmk2_ros2.py:/workspace/supermarket_sorting_task/examples/ros2/mmk2_ros2.py:ro" \
-  -v "$ROOT/baseline/patches/examples/ros2/mmk2_ros2.py:/workspace/supermarket_sorting_task/examples/ros2/mmk2_ros2.py:ro" \
   "$IMAGE_SERVER" bash -lc \
   'cd /workspace/supermarket_sorting_task && source /opt/ros/humble/setup.bash && python3 -u /workspace/baseline/random_server_bootstrap.py'
 
@@ -212,7 +211,60 @@ docker run -d --name "$CLIENT_NAME" --gpus all --network host --ipc host \
   "${PASS_ENV[@]}" \
   -v supermarket_sorting_cache:/root/.cache \
   -v "$ROOT/baseline:/workspace/baseline:rw" \
-  "$IMAGE_CLIENT" bash -lc "bash /workspace/baseline/client_entrypoint.sh"
+  "$IMAGE_CLIENT" bash -lc "
+set -e
+exec 2> >(tee -a /tmp/client_trace.log >&2)
+set -x
+source /opt/ros/humble/setup.bash
+python3 -u /workspace/baseline/multiclass_detect.py \
+    --weights '$MULTICLASS_WEIGHTS' --device '${DEVICE:-cuda}' --confidence $DETECTION_CONFIDENCE &
+DET_PID=\$!
+trap 'kill \$DET_PID 2>/dev/null || true' EXIT
+READY=0
+for i in \$(seq 1 60); do
+  if ! kill -0 \$DET_PID 2>/dev/null; then
+    echo '检测器提前退出，拒绝启动编排器' >&2
+    exit 1
+  fi
+  if ros2 topic list --no-daemon 2>/dev/null | grep -qx '/multiclass/detections'; then
+    READY=1
+    echo '检测器就绪：/multiclass/detections'
+    break
+  fi
+  sleep 1
+done
+if [[ \$READY -ne 1 ]]; then
+  echo '检测器未在 60 秒内创建 /multiclass/detections，拒绝启动编排器' >&2
+  exit 1
+fi
+# ArUco 货位识别（传统视觉，不需要训练）：官方 aruco_detect.py，
+# DICT_4X4_50 / marker_size 0.03m / --detect-scale 2（3cm 码放 2 倍后更好检）。
+# 发布 /aruco/head/ids，供 executor 把"商品 kind ↔ 货位"绑定到布局真值上。
+# ⚠️ 必须 --image-topic-mode native：默认 color 读的是 3DGS 渲染图，里面
+# 没有 ArUco 格子（GS 不带 MJCF 纹理），实测会一直 no valid markers。
+echo '==> 启动 ArUco 货位识别节点'
+python3 -u /workspace/baseline/official_baseline/examples/supermarket_sorting/perception/aruco_detect.py \
+    --cameras head --marker-size 0.03 --detect-scale 2 --no-tf --image-topic-mode native > /tmp/aruco_detect.log 2>&1 &
+ARUCO_PID=\$!
+trap 'kill \$DET_PID \$ARUCO_PID 2>/dev/null || true' EXIT
+# ArUco 只是加分项：它挂掉绝不能让主流程跟着死（set -e 下后台命令
+# 的非零退出会直接终止容器，实测客户端 30 秒就退出）。
+sleep 1
+if ! kill -0 \$ARUCO_PID 2>/dev/null; then
+  echo 'WARN: ArUco 识别节点未存活（不影响抓取主流程，仅失去货位吸附）' >&2
+  tail -5 /tmp/aruco_detect.log >&2 || true
+fi
+echo '==> 启动编排器（ArUco 已在后台）'
+python3 -u /workspace/baseline/inventory_competition_executor.py \
+    --execute --confirm random5${STOP_AFTER_IK_ARG}${STOP_AFTER_CLOSE_ARG} \
+    --map-timeout ${MAP_TIMEOUT:-240} \
+    --mapping-max-speed $MAPPING_SPEED \
+    --cruise-max-speed $CRUISE \
+    --obstacle-distance $OBSTACLE_DIST \
+    --min-samples 5 \
+    --min-confidence $MAP_CONFIDENCE \
+    --map-path /workspace/baseline/debug_data/inventory_map_autopilot.json
+"
 
 echo "================================================================"
 echo "Server 容器: $SERVER_NAME   Client 容器: $CLIENT_NAME"

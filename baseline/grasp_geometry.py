@@ -76,7 +76,13 @@ class GraspGeometry:
 DEFAULT_GEOMETRY = GraspGeometry(
     surface_to_center_fwd=float(os.getenv("SUPERMARKET_SURFACE_TO_CENTER_FWD", "0.0265")),
     deploy_offset=(
-        float(os.getenv("SUPERMARKET_DEPLOY_DX", "-0.011")),
+        # 横向偏置（09-13 修正）：DX 加在世界坐标 x 上，机器人面向货架
+        # （yaw=+90°）时 +x=机器人右侧、-x=左侧。此前 -0.056/-0.110 的
+        # "左漂补偿"把坐标系搞反了（REP-103 的 x 朝前/y 朝左是本体系，
+        # 不是这里的世界系），实测越负越偏左：-0.060 偏左 6cm、-0.110
+        # 偏左 11cm（诊断帧+主人截图）。回退基线 -0.011（8/8 标定全成
+        # 功的值），残余偏差交伺服 j3 收尾（±3-4cm 量程）。
+        float(os.getenv("SUPERMARKET_DEPLOY_DX", "0.02")),   # 09-13 主人定：+0.02（向右 2cm 微调）
         float(os.getenv("SUPERMARKET_DEPLOY_DY", "-0.220")),
         float(os.getenv("SUPERMARKET_DEPLOY_DZ", "-0.010")),
     ),
@@ -184,11 +190,11 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         # 掌+腕）前端刮到下层板前沿，底盘推进被层板抵住（ee_y 卡 3.150，
         # 每秒仅 0.5mm，主人目视确认"被薯片下面的货架板抵住"）。罐高 0.21，
         # 指头抓在中心上方 3cm 依然稳定，整只手随之上抬离开层板沿。
-        deploy_offset=(-0.011, -0.220, 0.030),
-        # 2026-09-12 深夜：0.035 时指头平面落后罐身 ~2cm（比赛流程连续夹空），
-        # 0.010（停止线深 2.5cm）+ 手眼伺服横向收敛后抓取成功
-        # （feedback 0.8091 ≈ 预测 0.813，抬升成功）。
-        creep_stop_dy=0.010,
+        deploy_offset=(0.02, -0.220, 0.030),   # dx +0.02（主人 09-13 定）；dz+0.030 防层板刮蹭
+        # 2026-09-12 深夜：0.035 时指头平面落后罐身 ~2cm（比赛流程连续夹空）。
+        # 2026-09-13 主人实测：0.010 仍"只夹到桶的一半"——插入深度不足，
+        # 再加深 2cm 到 -0.010（停止线 = y+0.0225，指头平面越过罐心）。
+        creep_stop_dy=-0.010,
         shape="cylinder",
         dimensions_m=(0.0650, 0.0650, 0.2100),
         mass_kg=0.1370,

@@ -243,16 +243,32 @@ def evaluate_obstacle_layout(selected):
 def generate_obstacle_layout(seed=None):
     rng = random.Random(seed)
     last_reason = "no candidates evaluated"
+    # 靠墙偏置（2026-09-13，队伍定制）：障碍物生成后向最近的 x 侧墙推
+    # SUPERMARKET_OBSTACLE_WALL_HUG 米（默认 0.30），走廊中央留出宽敞
+    # 直通道——此前模板位置居中，配送 A* 只能沿墙绕行，载货手臂刮墙
+    # 楔死（主人实测"左墙右障卡住"）。贴墙合法性由
+    # _physical_geometry_is_clear / evaluate_obstacle_layout 校验兜底，
+    # 不合法的候选自动重采样；rng 调用顺序与原版一致（同 seed 可复现）。
+    # 温和靠墙偏置：采样后向就近 x 侧墙推 0.15m（保持模板蛇形交替结构，
+    # 校验器的强制绕行/带间距/路径检查全部照常），让路线整体比原版离墙
+    # 更远。push 过大（0.30/交替贴墙）会被"起点终点被堵/不强制绕行"
+    # 校验拒绝（实测 5000 次全败）。
+    wall_push = 0.15
+    hug_center_x = (CORRIDOR_X_MIN + CORRIDOR_X_MAX) / 2.0
     for attempts in range(1, MAX_LAYOUT_ATTEMPTS + 1):
         template = rng.choice(SLALOM_TEMPLATE_POSITIONS)
-        selected = tuple(
-            (
-                x + rng.uniform(-POSITION_JITTER_X, POSITION_JITTER_X),
-                y + rng.uniform(-POSITION_JITTER_Y, POSITION_JITTER_Y),
-                rng.choice(OBSTACLE_YAWS),
-            )
-            for x, y in template
-        )
+        selected_list = []
+        for x, y in template:
+            sx = x + rng.uniform(-POSITION_JITTER_X, POSITION_JITTER_X)
+            sy = y + rng.uniform(-POSITION_JITTER_Y, POSITION_JITTER_Y)
+            yaw = rng.choice(OBSTACLE_YAWS)
+            if wall_push > 0.0:
+                if sx <= hug_center_x:
+                    sx = max(CORRIDOR_X_MIN + OBSTACLE_WALL_GAP + 0.36, sx - wall_push)
+                else:
+                    sx = min(CORRIDOR_X_MAX - OBSTACLE_WALL_GAP - 0.36, sx + wall_push)
+            selected_list.append((sx, sy, yaw))
+        selected = tuple(selected_list)
         evaluation = evaluate_obstacle_layout(selected)
         if not evaluation.valid:
             last_reason = evaluation.reason
