@@ -171,6 +171,15 @@ docker run -d --name "${SERVER_NAME}_telem" --network host --ipc host \
   "source /opt/ros/humble/setup.bash && python3 -u /workspace/baseline/debug_data/referee_target_monitor.py --output-dir /workspace/baseline/$TELEM_REL --duration 1500"
 
 echo "==> 启动 Client：检测 + 自主执行（executor 自动 spawn 巡游/抓取/配送 worker）"
+# 现场调参透传：把调用者环境里所有 SUPERMARKET_* 一次性塞进容器。
+# 此前只显式传了固定几个 -e，导致 launch_comp.sh 的 export 到不了容器，
+# 调参看着"没生效"（实测 ARM_LATERAL_OFFSET=-0.20 只落地了默认 -2cm）。
+# 同名 -e 后面的会覆盖前面，所以已有的显式项不受影响。
+PASS_ENV=()
+while IFS= read -r _kv; do
+  [ -n "$_kv" ] && PASS_ENV+=(-e "$_kv")
+done < <(env | grep -E '^SUPERMARKET_[A-Z0-9_]+=' || true)
+echo "==> 透传 SUPERMARKET_* 调参项 ${#PASS_ENV[@]} 个"
 docker run -d --name "$CLIENT_NAME" --gpus all --network host --ipc host \
   -e ROS_DOMAIN_ID="$DOMAIN" \
   -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
@@ -185,6 +194,9 @@ docker run -d --name "$CLIENT_NAME" --gpus all --network host --ipc host \
   -e SUPERMARKET_ARM_PREGRASP_Y="$ARM_PREGRASP_Y" \
   -e SUPERMARKET_ARM_ODOM_STABLE_SAMPLES="$ARM_ODOM_STABLE_SAMPLES" \
   -e SUPERMARKET_PLAN_GATE_TIMEOUT="$PLAN_GATE_TIMEOUT" \
+  -e SUPERMARKET_ARM_LATERAL_OFFSET_M="${SUPERMARKET_ARM_LATERAL_OFFSET_M:-}" \
+  -e SUPERMARKET_GRASP_Z_OFFSET_M="${SUPERMARKET_GRASP_Z_OFFSET_M:-}" \
+  -e SUPERMARKET_SERVO_LATERAL_GAIN="${SUPERMARKET_SERVO_LATERAL_GAIN:-}" \
   -e SUPERMARKET_PITCH_DWELL_S="${SUPERMARKET_PITCH_DWELL_S:-1.0}" \
   -e SUPERMARKET_SKIP_SCAN="$SKIP_SCAN" \
   -e DISPLAY="$X11_DISPLAY" \
@@ -194,6 +206,7 @@ docker run -d --name "$CLIENT_NAME" --gpus all --network host --ipc host \
   -e MAX_JOBS="${MAX_JOBS:-2}" \
   -e TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}" \
   -e TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
+  "${PASS_ENV[@]}" \
   -v supermarket_sorting_cache:/root/.cache \
   -v "$ROOT/baseline:/workspace/baseline:rw" \
   "$IMAGE_CLIENT" bash -lc "
