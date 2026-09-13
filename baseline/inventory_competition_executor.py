@@ -151,6 +151,11 @@ Z_LEVEL_CLAMP_M = _env_float("SUPERMARKET_Z_LEVEL_CLAMP_M", 0.025)
 # （servo 只写 j3，结果里 height 恒为 +0.0cm），于是指头停在商品上方悬空
 # （主人目视确认）。这里把高度钉在"该货位层高 LEVEL_Z + 偏置"上，视觉 z 只当参考。
 GRASP_Z_OFFSET_M = _env_float("SUPERMARKET_GRASP_Z_OFFSET_M", -0.02)
+# 抓取横向（左右）偏置：现场可调的"整体左移/右移"旋钮（m，负=往西/往左）。
+# 背景：主人实测每次抓取机械臂都向左偏 4~5cm，而手眼伺服的横向 j3 修正
+# 已被证明不可靠（同帧重复、残差 ±2.6cm 纹丝不动、两档增益都发散），
+# 所以横向改走"开环偏置补偿"这条确定的路径：直接把目标 x 平移。
+ARM_LATERAL_OFFSET_M = _env_float("SUPERMARKET_ARM_LATERAL_OFFSET_M", -0.02)
 # 跳巡游扫描：比赛时限 420s，而 E→D→C→B→A 全扫描实测要 5-8 分钟。
 # 任务清单（目标 kind）与 45 槽位布局都是已知的，可直接用布局真值预填地图
 # 并立即进入执行阶段，把扫描时间全部省掉。
@@ -192,6 +197,9 @@ TRACK_STABILITY_WINDOW = max(6, _env_int("SUPERMARKET_TRACK_STABILITY_WINDOW", 8
 #   deploy 降到同高 → servo① 左右校准（罐子完整可见，防止进深时指头顶歪
 #   罐子——实测罐子被顶成 57-68° 斜躺后无法抓取）→ creep 进深 → servo②
 #   抓取面微调（修正进深漂移）→ close（夹空则 +1.5cm 深度探测再循环）。
+# 伺服步骤已移除（主人 09-13 定案"纯恶心人"）：手眼伺服三连败——
+# HSV 锁到相邻红柱抓歪、垂直 9cm 修不完挂死、超时触发 IK 不可达的重部署。
+# 纯 deploy(IK) + creep(末端三轴闭环) 的开环链实测更稳。
 ARM_ACTIONS = ("safe_pose", "deploy", "servo", "creep", "servo", "close_gripper", "lift", "retreat", "slide_reset")
 POST_PLACE_SAFE_POSE = "post_place_safe_pose"
 # 手眼伺服：偏差超过 SERVO_APPLY_THRESHOLD 则带修正量回退重部署；
@@ -1080,22 +1088,29 @@ class InventoryCompetitionExecutor(Node):
             self._spawn_nav(speed, pickup, pickup_transit)
 
     def _apply_pending_vertical_correction(self, cand: object) -> None:
-        """把伺服闭环待定的高度修正量加到候选 z（负=压低）。"""
-        if abs(self._servo_pending_dz) < 1e-6:
-            return
+        """把伺服闭环待定的高度修正与横向开环偏置加到候选目标上。
+
+        x：ARM_LATERAL_OFFSET_M（负=往西，补偿"每次都向左偏"）
+        z：伺服闭环残差（负=压低）
+        """
         world = getattr(cand, "world", None)
         if not world:
             return
-        cand.world = (
-            float(world[0]),
-            float(world[1]),
-            float(world[2]) + float(self._servo_pending_dz),
-        )
-        self.get_logger().warning(
-            f"[exec] 高度闭环：应用伺服残差 {self._servo_pending_dz * 100:+.1f}cm，"
-            f"目标 z → {cand.world[2]:.3f}"
-        )
-        self._servo_pending_dz = 0.0
+        new_x = float(world[0]) + ARM_LATERAL_OFFSET_M
+        new_z = float(world[2])
+        if abs(self._servo_pending_dz) > 1e-6:
+            new_z += float(self._servo_pending_dz)
+            self.get_logger().warning(
+                f"[exec] 高度闭环：应用伺服残差 {self._servo_pending_dz * 100:+.1f}cm，"
+                f"目标 z → {new_z:.3f}"
+            )
+            self._servo_pending_dz = 0.0
+        if abs(new_x - float(world[0])) > 1e-6:
+            self.get_logger().warning(
+                f"[exec] 横向偏置：目标 x {float(world[0]):.3f} → {new_x:.3f}"
+                f"（{ARM_LATERAL_OFFSET_M * 100:+.1f}cm）"
+            )
+        cand.world = (new_x, float(world[1]), new_z)
 
     def _note_servo_height_error(self, measured: bool) -> bool:
         """消费伺服测到的竖直残差；需要重部署时返回 True。"""
@@ -1126,7 +1141,10 @@ class InventoryCompetitionExecutor(Node):
             )
             return False
         self._servo_height_retry += 1
-        self._servo_pending_dz = max(-0.08, min(0.08, -err_v))
+        # 符号：servo 的 vertical_err 为正 = 商品在图像里偏下 = 指头偏低。
+        # 实测指头悬空在上方时 servo 报 -9.4~-2.7cm（负）→ 必须压低，
+        # 即 dz 与 err_v 同号。此前写成 -err_v，等于"越悬空越往上抬"。
+        self._servo_pending_dz = max(-0.08, min(0.08, err_v))
         self.get_logger().warning(
             f"[exec] 高度闭环：伺服竖直残差 {err_v * 100:+.1f}cm → 目标 z "
             f"{self._servo_pending_dz * 100:+.1f}cm，退开重部署后复测"
@@ -1142,17 +1160,14 @@ class InventoryCompetitionExecutor(Node):
     def _servo_redeploy_tick(self) -> None:
         step = self._servo_redeploy_step
         if step == 1:
-            self._spawn_arm("slide_up")
+            self._spawn_arm("deploy")
             self._servo_redeploy_step = 2
         elif step == 2:
-            self._spawn_arm("deploy")
+            self._spawn_arm("creep")
             self._servo_redeploy_step = 3
         elif step == 3:
-            self._spawn_arm("creep")
-            self._servo_redeploy_step = 4
-        elif step == 4:
             self._spawn_arm("servo")
-            self._servo_redeploy_step = 5
+            self._servo_redeploy_step = 4
         else:
             self._servo_redeploy_step = 0
 
@@ -2316,11 +2331,10 @@ class InventoryCompetitionExecutor(Node):
                 )
             else:
                 self.get_logger().warning("[exec] 手眼伺服未测得目标，直接闭爪")
-            # 垂直方向闭环：伺服是高度唯一可信来源（视觉 z 逐层偏高）。
-            # 残差超门限 → 把修正量挂到候选 z 上，退开重部署再测。
-            if self._note_servo_height_error(measured):
-                self._begin_servo_redeploy()
-                return
+            # 垂直方向闭环已删除（主人 09-13 定案"高度不需要修"）：
+            # 圆柱侧抓对垂直不敏感，而闭环触发的重部署目标（视觉 z 逐层偏高、
+            # 实测 z≈0.965 对应第三层）在升降柱复位姿态下 IK 不可达，
+            # 挂死整轮。伺服收敛后直接进入闭爪。
         if self.stop_after_close and completed_action == "close_gripper":
             target = self._current()
             if target is not None:
