@@ -157,6 +157,11 @@ docker run -d --name "$SERVER_NAME" --gpus all --network host --ipc host \
   -v supermarket_sorting_cache:/root/.cache \
   -v "$ROOT/baseline:/workspace/baseline:ro" \
   -v "$ROOT/baseline/patches/discoverse/envs/simulator.py:/workspace/supermarket_sorting_task/discoverse/envs/simulator.py:ro" \
+  # mmk2_ros2.py 补丁必须一起挂：random_server_bootstrap 用 args=(24, stop_event)
+  # 调用 thread_pubros2topic，镜像里的官方版签名是 (self, freq=30) →
+  # "takes 1 to 2 positional arguments but 3 were given" → ros-topic-publisher
+  # 线程抛异常把 server 打死（窗口一弹就退，实测）。
+  -v "$ROOT/baseline/patches/examples/ros2/mmk2_ros2.py:/workspace/supermarket_sorting_task/examples/ros2/mmk2_ros2.py:ro" \
   -v "$ROOT/baseline/patches/examples/ros2/mmk2_ros2.py:/workspace/supermarket_sorting_task/examples/ros2/mmk2_ros2.py:ro" \
   "$IMAGE_SERVER" bash -lc \
   'cd /workspace/supermarket_sorting_task && source /opt/ros/humble/setup.bash && python3 -u /workspace/baseline/random_server_bootstrap.py'
@@ -212,7 +217,8 @@ docker run -d --name "$CLIENT_NAME" --gpus all --network host --ipc host \
   -v supermarket_sorting_cache:/root/.cache \
   -v "$ROOT/baseline:/workspace/baseline:rw" \
   "$IMAGE_CLIENT" bash -lc "
-set -e
+# 不用 set -e：它会让脚本在"检测器就绪"之后直接退出（实测客户端 exit 0、
+# ArUco/编排器根本没启动）。改为显式判断每一步。
 source /opt/ros/humble/setup.bash
 python3 -u /workspace/baseline/multiclass_detect.py \
     --weights '$MULTICLASS_WEIGHTS' --device '${DEVICE:-cuda}' --confidence $DETECTION_CONFIDENCE &
@@ -240,11 +246,19 @@ fi
 # 发布 /aruco/head/ids，供 executor 把"商品 kind ↔ 货位"绑定到布局真值上。
 # ⚠️ 必须 --image-topic-mode native：默认 color 读的是 3DGS 渲染图，里面
 # 没有 ArUco 格子（GS 不带 MJCF 纹理），实测会一直 no valid markers。
+echo '==> 启动 ArUco 货位识别节点'
 python3 -u /workspace/baseline/official_baseline/examples/supermarket_sorting/perception/aruco_detect.py \
     --cameras head --marker-size 0.03 --detect-scale 2 --no-tf --image-topic-mode native > /tmp/aruco_detect.log 2>&1 &
 ARUCO_PID=\$!
 trap 'kill \$DET_PID \$ARUCO_PID 2>/dev/null || true' EXIT
+# ArUco 只是加分项：它挂掉绝不能让主流程跟着死（set -e 下后台命令
+# 的非零退出会直接终止容器，实测客户端 30 秒就退出）。
 sleep 1
+if ! kill -0 \$ARUCO_PID 2>/dev/null; then
+  echo 'WARN: ArUco 识别节点未存活（不影响抓取主流程，仅失去货位吸附）' >&2
+  tail -5 /tmp/aruco_detect.log >&2 || true
+fi
+echo '==> 启动编排器（ArUco 已在后台）'
 python3 -u /workspace/baseline/inventory_competition_executor.py \
     --execute --confirm random5${STOP_AFTER_IK_ARG}${STOP_AFTER_CLOSE_ARG} \
     --map-timeout ${MAP_TIMEOUT:-240} \
