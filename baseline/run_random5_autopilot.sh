@@ -130,6 +130,8 @@ docker run -d --name "$SERVER_NAME" --gpus all --network host --ipc host \
   -e SUPERMARKET_GS_BATCH_RENDER="$GS_BATCH_RENDER" \
   -e SUPERMARKET_GS_HEAD_ONLY="$GS_HEAD_ONLY" \
   -e SUPERMARKET_GS_ASYNC="$GS_ASYNC" \
+  -e SUPERMARKET_PUBLISH_ARUCO_NATIVE="${SUPERMARKET_PUBLISH_ARUCO_NATIVE:-1}" \
+  -e SUPERMARKET_ARUCO_NATIVE_CAMERAS="${SUPERMARKET_ARUCO_NATIVE_CAMERAS:-head}" \
   -e SUPERMARKET_RENDER_FPS="$RENDER_FPS" \
   -e SUPERMARKET_ARM_PREGRASP_Y="$ARM_PREGRASP_Y" \
   -e SUPERMARKET_ARM_ODOM_STABLE_SAMPLES="$ARM_ODOM_STABLE_SAMPLES" \
@@ -233,6 +235,14 @@ if [[ \$READY -ne 1 ]]; then
   echo '检测器未在 60 秒内创建 /multiclass/detections，拒绝启动编排器' >&2
   exit 1
 fi
+# ArUco 货位识别（传统视觉，不需要训练）：官方 aruco_detect.py，
+# DICT_4X4_50 / marker_size 0.03m / --detect-scale 2（3cm 码放 2 倍后更好检）。
+# 发布 /aruco/head/ids，供 executor 把"商品 kind ↔ 货位"绑定到布局真值上。
+python3 -u /workspace/baseline/official_baseline/examples/supermarket_sorting/perception/aruco_detect.py \
+    --cameras head --marker-size 0.03 --detect-scale 2 --no-tf > /tmp/aruco_detect.log 2>&1 &
+ARUCO_PID=\$!
+trap 'kill \$DET_PID \$ARUCO_PID 2>/dev/null || true' EXIT
+sleep 1
 python3 -u /workspace/baseline/inventory_competition_executor.py \
     --execute --confirm random5${STOP_AFTER_IK_ARG}${STOP_AFTER_CLOSE_ARG} \
     --map-timeout ${MAP_TIMEOUT:-240} \

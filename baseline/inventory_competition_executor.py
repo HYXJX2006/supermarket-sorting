@@ -25,10 +25,21 @@ from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-from std_msgs.msg import Float64MultiArray, String
+from std_msgs.msg import Float64MultiArray, Int32MultiArray, String
 from vision_msgs.msg import Detection3DArray
 
 from inventory_map import LEVEL_Z, SHELF_ORDER_FOR_ROUTE, SLOT_X, InventoryEntry, InventoryMap
+from shelf_map import slot_from_aruco
+
+
+def aruco_slot_world(aruco_id: int) -> tuple[float, float, float]:
+    """ArUco ID → 货位名义世界坐标（布局真值：列间距/层高都是固定的）。"""
+    slot = slot_from_aruco(int(aruco_id))
+    return (
+        float(SLOT_X[slot.shelf][slot.column - 1]),
+        3.243,
+        float(LEVEL_Z[slot.level]),
+    )
 
 TASK_TOPIC = "/supermarket_sorting/task"
 DETECTION_TOPIC = "/multiclass/detections"
@@ -39,6 +50,12 @@ NAV_META_TOPIC = "/competition/navigation_goal_meta"
 TARGET_STATUS_TOPIC = "/competition/target_status"
 GRASP_GOAL_TOPIC = "/competition/grasp_goal"
 GRASP_META_TOPIC = "/competition/grasp_goal_meta"
+ARUCO_IDS_TOPIC = os.getenv("SUPERMARKET_ARUCO_IDS_TOPIC", "/aruco/head/ids")
+# ArUco 吸附开关与容差：只有当前货位码被看到、且视觉坐标与货位名义坐标
+# 相差在容差内时才吸附（防止看错相邻货位）。x/z 用布局真值（层高已知、
+# 列间距 0.22m 也已知），y 仍用视觉（深度是唯一能测进深的来源）。
+USE_ARUCO_SLOT = _env_float("SUPERMARKET_USE_ARUCO_SLOT", 1.0) > 0.0
+ARUCO_SNAP_TOL_M = _env_float("SUPERMARKET_ARUCO_SNAP_TOL_M", 0.08)
 PLACE_STATUS_TOPIC = "/competition/place_status"
 INVENTORY_TOPIC = "/competition/inventory_map"
 FLOW_STATUS_TOPIC = "/competition/inventory_flow_status"
@@ -409,6 +426,10 @@ class InventoryCompetitionExecutor(Node):
         self.create_subscription(Odometry, ODOM_TOPIC, self._on_odom, qos_profile_sensor_data)
         self.create_subscription(String, NAV_STATUS_TOPIC, self._on_nav_status, 10)
         self.create_subscription(String, PLACE_STATUS_TOPIC, self._on_place_status, 10)
+        # ArUco 货位 ID：一码一货位（A0-8…E36-44，L1→L3、C1→C3），
+        # 只说明"正在看哪个格子"，商品仍由 YOLO 认。用它把抓取点的 x/z
+        # 吸附到布局真值，省掉"猜货位"这一环（2026-09-13 接入）。
+        self.create_subscription(Int32MultiArray, ARUCO_IDS_TOPIC, self._on_aruco_ids, 10)
         self.inventory_pub = self.create_publisher(String, INVENTORY_TOPIC, NAV_QOS)
         self.flow_pub = self.create_publisher(String, FLOW_STATUS_TOPIC, NAV_QOS)
         self.target_pub = self.create_publisher(String, TARGET_STATUS_TOPIC, NAV_QOS)
@@ -416,6 +437,8 @@ class InventoryCompetitionExecutor(Node):
         self.nav_meta_pub = self.create_publisher(String, NAV_META_TOPIC, NAV_QOS)
         self.grasp_goal_pub = self.create_publisher(PoseStamped, GRASP_GOAL_TOPIC, 10)
         self.grasp_meta_pub = self.create_publisher(String, GRASP_META_TOPIC, NAV_QOS)
+        self.aruco_ids: tuple[int, ...] = ()
+        self.aruco_seen_at = 0.0
         self.head_pub = self.create_publisher(Float64MultiArray, HEAD_CMD_TOPIC, 10)
         self.create_timer(0.1, self._tick)
         self.get_logger().warning(
@@ -1093,6 +1116,63 @@ class InventoryCompetitionExecutor(Node):
             self.nav_worker = None
         if self.nav_worker is None:
             self._spawn_nav(speed, pickup, pickup_transit)
+
+    def _on_aruco_ids(self, message: Int32MultiArray) -> None:
+        ids = tuple(sorted({int(v) for v in (message.data or []) if 0 <= int(v) < 45}))
+        if ids != self.aruco_ids:
+            self.aruco_ids = ids
+            self.get_logger().info(
+                f"[exec] ArUco 可见货位 ID={list(ids)}"
+                + (
+                    "  → " + ",".join(slot_from_aruco(i).label for i in ids[:6])
+                    if ids else "（本帧无码）"
+                )
+            )
+        self.aruco_seen_at = time.monotonic()
+
+    def _apply_aruco_slot_snap(self, cand: object) -> None:
+        """把候选的 x/z 吸附到 ArUco 所指货位的名义坐标（布局真值）。
+
+        规则：
+          - 必须看到"候选所在货位"的那个码（相邻码不算，除非候选与相邻
+            货位名义坐标重叠在容差内）；
+          - 视觉 x/z 与名义坐标差距必须在 ARUCO_SNAP_TOL_M 内才吸附，
+            否则只告警不动手（防止把目标拉到错误货位）；
+          - y 保持视觉值：深度是进深方向的唯一来源。
+        """
+        if not USE_ARUCO_SLOT or not self.aruco_ids:
+            return
+        world = getattr(cand, "world", None)
+        if not world:
+            return
+        slot = str(getattr(cand, "slot", "") or "")
+        if not slot:
+            return
+        expected_id = getattr(cand, "aruco_id", None)
+        if expected_id is None or int(expected_id) not in self.aruco_ids:
+            self.get_logger().info(
+                f"[exec] ArUco：候选 {slot} 的码 {expected_id} 不在可见列表 "
+                f"{list(self.aruco_ids)}，不吸附（沿用视觉坐标）"
+            )
+            return
+        nominal = aruco_slot_world(int(expected_id))
+        dx = abs(float(world[0]) - nominal[0])
+        dz = abs(float(world[2]) - nominal[2])
+        if max(dx, dz) > ARUCO_SNAP_TOL_M:
+            self.get_logger().warning(
+                f"[exec] ArUco：候选 {slot} 视觉 x/z=({float(world[0]):.3f},"
+                f"{float(world[2]):.3f}) 与货位名义 ({nominal[0]:.3f},{nominal[2]:.3f}) "
+                f"差 ({dx*100:.1f},{dz*100:.1f})cm 超容差 "
+                f"{ARUCO_SNAP_TOL_M*100:.0f}cm，不吸附"
+            )
+            return
+        new_world = (nominal[0], float(world[1]), nominal[2])
+        self.get_logger().warning(
+            f"[exec] ArUco 吸附：{slot} (码 {int(expected_id)}) "
+            f"x/z {float(world[0]):.3f}/{float(world[2]):.3f} → "
+            f"{nominal[0]:.3f}/{nominal[2]:.3f}（布局真值），y 保持 {float(world[1]):.3f}"
+        )
+        cand.world = new_world
 
     def _apply_pending_vertical_correction(self, cand: object) -> None:
         """把伺服闭环待定的高度修正与横向开环偏置加到候选目标上。
@@ -1974,6 +2054,7 @@ class InventoryCompetitionExecutor(Node):
             )
             cand.world = (old[0], old[1] + DETECTION_Y_BIAS, old[2])
             # 伺服测出的高度残差在这里补上（视觉 z 不可信时，伺服是唯一真值）
+            self._apply_aruco_slot_snap(cand)
             self._apply_pending_vertical_correction(cand)
             return
         old = cand.world
@@ -2014,6 +2095,7 @@ class InventoryCompetitionExecutor(Node):
                 )
             clamped = (refined[0], refined[1], target_z)
         cand.world = clamped
+        self._apply_aruco_slot_snap(cand)
         self._apply_pending_vertical_correction(cand)
         self.get_logger().info(
             f"[exec] 近距复核：{kind} 目标 "
