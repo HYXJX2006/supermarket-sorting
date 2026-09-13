@@ -1476,8 +1476,11 @@ class InventoryCompetitionExecutor(Node):
             # + server 同步挂载），走廊中央天然宽敞；膨胀过大（1.7）会让
             # 靠墙障碍与墙间无可行格，A* 直接失败（实测）。SUPERMARKET_
             # NAV_INFLATE 可调。
+            # 1.3 倍（0.45m）：0.347 只保底盘，手臂向左漂 4~11cm 时
+            # 车缘离墙 0.147m 的余量被吃光 → 刮墙卡死（主人实测）。
+            # 1.3 倍给 18cm 手臂余量，且靠墙障碍+墙之间仍可行（1.7 曾无解）。
             radius = float(layout.ROBOT_CLEARANCE_RADIUS) * _env_float(
-                "SUPERMARKET_NAV_INFLATE", "1.35"
+                "SUPERMARKET_NAV_INFLATE", "1.3"
             )
             resolution = float(layout.GRID_RESOLUTION)
             x_min = float(layout.CORRIDOR_X_MIN) + radius
@@ -1522,8 +1525,18 @@ class InventoryCompetitionExecutor(Node):
                                 return candidate
                 return None
 
-            start_cell = nearest_free(to_cell(start))
-            goal_cell = nearest_free(to_cell(goal))
+            # 端点钳制到网格内：膨胀放大后网格 y 边界（2.71-半径）会小于
+            # 固定路线端点 y（2.30/−1.54）——走廊 y 端点不是物理墙，钳位
+            # 安全；不钳位则 nearest_free 永远 None → 配送路线生成失败 →
+            # 机器人原地"假放置"（2026-09-13 三单假放置的根因）。
+            def _clamp_cell(cell: tuple[int, int]) -> tuple[int, int]:
+                return (
+                    max(0, min(nx - 1, cell[0])),
+                    max(0, min(ny - 1, cell[1])),
+                )
+
+            start_cell = nearest_free(_clamp_cell(to_cell(start)))
+            goal_cell = nearest_free(_clamp_cell(to_cell(goal)))
             if start_cell is None or goal_cell is None:
                 return None
             moves = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0), (1, 1, math.sqrt(2.0)), (1, -1, math.sqrt(2.0)), (-1, 1, math.sqrt(2.0)), (-1, -1, math.sqrt(2.0)))
@@ -1541,6 +1554,14 @@ class InventoryCompetitionExecutor(Node):
                     if dx and dy and (blocked((cell[0] + dx, cell[1])) or blocked((cell[0], cell[1] + dy))):
                         continue
                     candidate_distance = distance[cell] + cost * resolution
+                    # 靠墙软代价：离走廊中线越远每米加价越多（最高 ~0.35/m），
+                    # 路线倾向中央、远离"障碍-墙"夹缝；不改变可行性。
+                    _nx, _ny = to_point(neighbor)
+                    _half_w = (float(layout.CORRIDOR_X_MAX) - float(layout.CORRIDOR_X_MIN)) / 2.0
+                    _center_x = (float(layout.CORRIDOR_X_MAX) + float(layout.CORRIDOR_X_MIN)) / 2.0
+                    candidate_distance += 0.35 * resolution * (
+                        abs(_nx - _center_x) / _half_w
+                    )
                     if candidate_distance >= distance.get(neighbor, math.inf):
                         continue
                     distance[neighbor] = candidate_distance

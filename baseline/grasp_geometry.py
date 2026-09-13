@@ -86,7 +86,8 @@ DEFAULT_GEOMETRY = GraspGeometry(
         float(os.getenv("SUPERMARKET_DEPLOY_DY", "-0.220")),
         float(os.getenv("SUPERMARKET_DEPLOY_DZ", "-0.010")),
     ),
-    creep_stop_dy=float(os.getenv("SUPERMARKET_CREEP_STOP_DY", "0.035")),
+    # 09-13：0.035 插入过浅（主人实测"只夹一点就掉"），全品类加深到 0.015
+    creep_stop_dy=float(os.getenv("SUPERMARKET_CREEP_STOP_DY", "0.015")),
     shape="unknown",
     dimensions_m=(0.0, 0.0, 0.0),
     mass_kg=0.0,

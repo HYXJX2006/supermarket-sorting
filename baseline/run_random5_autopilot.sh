@@ -157,6 +157,7 @@ docker run -d --name "$SERVER_NAME" --gpus all --network host --ipc host \
   -v supermarket_sorting_cache:/root/.cache \
   -v "$ROOT/baseline:/workspace/baseline:ro" \
   -v "$ROOT/baseline/patches/discoverse/envs/simulator.py:/workspace/supermarket_sorting_task/discoverse/envs/simulator.py:ro" \
+  -v "$ROOT/baseline/official_baseline/examples/supermarket_sorting/obstacle_layout.py:/workspace/supermarket_sorting_task/examples/supermarket_sorting/obstacle_layout.py:ro" \
   -v "$ROOT/baseline/patches/examples/ros2/mmk2_ros2.py:/workspace/supermarket_sorting_task/examples/ros2/mmk2_ros2.py:ro" \
   -v "$ROOT/baseline/patches/examples/ros2/mmk2_ros2.py:/workspace/supermarket_sorting_task/examples/ros2/mmk2_ros2.py:ro" \
   "$IMAGE_SERVER" bash -lc \

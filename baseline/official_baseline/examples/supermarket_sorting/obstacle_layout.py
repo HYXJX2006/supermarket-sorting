@@ -249,16 +249,14 @@ def generate_obstacle_layout(seed=None):
     # 楔死（主人实测"左墙右障卡住"）。贴墙合法性由
     # _physical_geometry_is_clear / evaluate_obstacle_layout 校验兜底，
     # 不合法的候选自动重采样；rng 调用顺序与原版一致（同 seed 可复现）。
-    # 温和靠墙偏置：采样后向就近 x 侧墙推 0.15m（保持模板蛇形交替结构，
-    # 校验器的强制绕行/带间距/路径检查全部照常），让路线整体比原版离墙
-    # 更远。push 过大（0.30/交替贴墙）会被"起点终点被堵/不强制绕行"
-    # 校验拒绝（实测 5000 次全败）。
+    # 实现（0.15 温和靠墙版，7/7 种子通过校验；0.30/交替贴墙版会被
+    # "起点终点被堵/不强制绕行"校验 5000 次全败——不要加大）。
     wall_push = 0.15
     hug_center_x = (CORRIDOR_X_MIN + CORRIDOR_X_MAX) / 2.0
     for attempts in range(1, MAX_LAYOUT_ATTEMPTS + 1):
         template = rng.choice(SLALOM_TEMPLATE_POSITIONS)
         selected_list = []
-        for x, y in template:
+        for index, (x, y) in enumerate(template):
             sx = x + rng.uniform(-POSITION_JITTER_X, POSITION_JITTER_X)
             sy = y + rng.uniform(-POSITION_JITTER_Y, POSITION_JITTER_Y)
             yaw = rng.choice(OBSTACLE_YAWS)
