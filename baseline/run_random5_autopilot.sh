@@ -157,10 +157,6 @@ docker run -d --name "$SERVER_NAME" --gpus all --network host --ipc host \
   -v supermarket_sorting_cache:/root/.cache \
   -v "$ROOT/baseline:/workspace/baseline:ro" \
   -v "$ROOT/baseline/patches/discoverse/envs/simulator.py:/workspace/supermarket_sorting_task/discoverse/envs/simulator.py:ro" \
-  # mmk2_ros2.py 补丁必须一起挂：random_server_bootstrap 用 args=(24, stop_event)
-  # 调用 thread_pubros2topic，镜像里的官方版签名是 (self, freq=30) →
-  # "takes 1 to 2 positional arguments but 3 were given" → ros-topic-publisher
-  # 线程抛异常把 server 打死（窗口一弹就退，实测）。
   -v "$ROOT/baseline/patches/examples/ros2/mmk2_ros2.py:/workspace/supermarket_sorting_task/examples/ros2/mmk2_ros2.py:ro" \
   -v "$ROOT/baseline/patches/examples/ros2/mmk2_ros2.py:/workspace/supermarket_sorting_task/examples/ros2/mmk2_ros2.py:ro" \
   "$IMAGE_SERVER" bash -lc \
