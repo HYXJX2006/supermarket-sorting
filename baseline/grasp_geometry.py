@@ -87,7 +87,10 @@ DEFAULT_GEOMETRY = GraspGeometry(
         float(os.getenv("SUPERMARKET_DEPLOY_DZ", "-0.010")),
     ),
     # 09-13：0.035 插入过浅（主人实测"只夹一点就掉"），全品类加深到 0.015
-    creep_stop_dy=float(os.getenv("SUPERMARKET_CREEP_STOP_DY", "0.015")),
+    # 全局默认抓取深度：0.015 → 0.010（09-13 加深试验：0.000 时指尖
+    # 顶层板产生假高反馈、空手演完整链——球类/圆柱类罐底贴层板，不能
+    # 低于中心太多。0.010 是"加深 5mm"与"不顶板"的平衡点）。
+    creep_stop_dy=float(os.getenv("SUPERMARKET_CREEP_STOP_DY", "0.010")),
     shape="unknown",
     dimensions_m=(0.0, 0.0, 0.0),
     mass_kg=0.0,
@@ -195,6 +198,9 @@ _OFFICIAL_GEOMETRY: dict[str, GraspGeometry] = {
         # 2026-09-12 深夜：0.035 时指头平面落后罐身 ~2cm（比赛流程连续夹空）。
         # 2026-09-13 主人实测：0.010 仍"只夹到桶的一半"——插入深度不足，
         # 再加深 2cm 到 -0.010（停止线 = y+0.0225，指头平面越过罐心）。
+        # 09-13 回调：-0.015 实测指尖顶到层板/罐底缘（罐高 21cm 底贴层板），
+        # 闭爪 feedback 0.79 是顶板假象，罐没动（裁判接触 0 帧）。
+        # 回到 -0.010（停止线 y+0.0225，历史 SUCCESS 轮的值）。
         creep_stop_dy=-0.010,
         shape="cylinder",
         dimensions_m=(0.0650, 0.0650, 0.2100),

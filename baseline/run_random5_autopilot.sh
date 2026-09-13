@@ -167,12 +167,12 @@ TELEM_STAMP="$(date +%Y%m%d_%H%M%S)"
 TELEM_REL="debug_data/random5_telem/${TELEM_STAMP}_seed${SEED}"
 mkdir -p "$ROOT/baseline/debug_data/random5_telem"
 echo "==> 启动裁判遥测记录器（商品侧 ground truth）：$TELEM_REL"
-docker run -d --name "${SERVER_NAME}_telem" --network host --ipc host \
+docker run -d --restart unless-stopped --name "${SERVER_NAME}_telem" --network host --ipc host \
   -e ROS_DOMAIN_ID="$DOMAIN" \
   -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
   -v "$ROOT/baseline:/workspace/baseline:rw" \
   "$IMAGE_CLIENT" bash -lc \
-  "source /opt/ros/humble/setup.bash && python3 -u /workspace/baseline/debug_data/referee_target_monitor.py --output-dir /workspace/baseline/$TELEM_REL --duration 1500"
+  "source /opt/ros/humble/setup.bash && python3 -u /workspace/baseline/debug_data/referee_target_monitor.py --output-dir /workspace/baseline/$TELEM_REL --duration 3600"
 
 echo "==> 启动 Client：检测 + 自主执行（executor 自动 spawn 巡游/抓取/配送 worker）"
 # 现场调参透传：把调用者环境里所有 SUPERMARKET_* 一次性塞进容器。
