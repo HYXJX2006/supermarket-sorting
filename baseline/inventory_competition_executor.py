@@ -128,9 +128,12 @@ PITCH_DWELL_S = float(os.getenv("SUPERMARKET_PITCH_DWELL_S", "1.5"))   # 比赛�
 # 原站位 y=-2.80 时车头离桌沿仅 ~0.09m（实测"离桌子太近"）；外移到 y=-2.55。
 DELIVERY_GOAL = (
     _env_float("SUPERMARKET_DELIVERY_GOAL_X", -1.94),
-    _env_float("SUPERMARKET_DELIVERY_GOAL_Y", -2.55),
+    # 09-14：原 -2.55 在配送区外 7cm（判定线 -2.62），配合激光避障
+    # 让车停在 -2.39 → place 永远被拒。移到 -2.85：区内 23cm，
+    # 车头距桌缘 -3.19 还有 0.13m（台面高 0.742 在车头上方，不碰）。
+    _env_float("SUPERMARKET_DELIVERY_GOAL_Y", -2.85),
     math.radians(_env_float("SUPERMARKET_DELIVERY_GOAL_YAW_DEG", -90.0)),
-)   # 配送区北缘内侧放置站位（referee delivery_base）
+)   # 配送区内放置站位（referee delivery_base）
 DELIVERY_BASE_X = (-2.420, -1.460)
 DELIVERY_BASE_Y = (-3.880, -2.620)
 # 检测坐标吸附到最近同类货位的半径：覆盖实测 8cm 误差，同时小于相邻货位
@@ -1130,6 +1133,12 @@ class InventoryCompetitionExecutor(Node):
         # 静态障碍（方块/货架）与动态障碍不能混为一谈。
         if planned_delivery:
             command.append("--planned-route")
+            # 末端进台豁免：delivery_table 是放置对象不是障碍。
+            # 最后一段（距 goal < 0.6m）激光避障反而把车挡在台外
+            # （主人实测"不能停得更近，放不过去"）。navigator 的
+            # front 停车仅在 obstacle_distance 内触发——放宽到 0.18
+            # 只保留物理碰撞前的最后防线。
+            command.extend(["--obstacle-distance", "0.18"])
         self.get_logger().info(
             f"[exec] spawn nav worker: speed={speed} pickup={pickup} pickup_transit={pickup_transit} "
             f"planned_delivery={planned_delivery} no_obstacles={self.no_obstacles} "
@@ -1622,8 +1631,21 @@ class InventoryCompetitionExecutor(Node):
             return goals
         corridor = self._plan_corridor_world(entry, DELIVERY_GOAL)
         if corridor is None:
-            self.get_logger().error("动态配送路线生成失败，不使用可能撞障碍的固定航点")
-            return []
+            # 膨胀过大导致无解时降一档重试（1.3→1.1），宁可贴墙也不把
+            # 机器人困在货架前空演 place（实测连锁事故）
+            self.get_logger().warning("动态配送路线无解，膨胀降 1.3→1.1 重试")
+            saved = os.environ.get("SUPERMARKET_NAV_INFLATE")
+            os.environ["SUPERMARKET_NAV_INFLATE"] = "1.1"
+            try:
+                corridor = self._plan_corridor_world(entry, DELIVERY_GOAL)
+            finally:
+                if saved is None:
+                    os.environ.pop("SUPERMARKET_NAV_INFLATE", None)
+                else:
+                    os.environ["SUPERMARKET_NAV_INFLATE"] = saved
+            if corridor is None:
+                self.get_logger().error("动态配送路线重试仍无解，放弃配送（不执行 place）")
+                return []
         points = corridor
         # 首段（货架前沿→走廊入口）用载货限速，不再满速：满速载货正是
         # 翻车敏感场景（实测倾角 47.1°）。走廊内维持 0.30 慢速绕障。
@@ -2303,6 +2325,19 @@ class InventoryCompetitionExecutor(Node):
         self._publish_flow("deliver_navigation_started")
 
     def _begin_place(self) -> None:
+        # 配送区硬校验：底盘不在配送区时绝不能执行 place——空手 place
+        # 会在货架前松爪把商品扔在地上（2026-09-13 苹果单实测：配送路线
+        # 生成失败后残留的旧"到达"事件在货架前触发了 place）。
+        if not self._in_delivery_base():
+            pos = (self.x, self.y) if self.x is not None else (None, None)
+            self.get_logger().error(
+                f"[exec] place 拒绝：底盘 ({pos[0]:.2f},{pos[1]:.2f}) 不在配送区，"
+                "继续导航"
+            )
+            if self.goal is not None:
+                self._publish_goal_msg(*self.goal)
+                self._ensure_nav(min(self.cruise_max_speed, DELIVERY_SPEED))
+            return
         self.phase = "place"
         self._spawn_arm("place")
 

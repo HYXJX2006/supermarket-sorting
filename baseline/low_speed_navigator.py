@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 
 import rclpy
@@ -561,9 +562,12 @@ class LowSpeedNavigator(Node):
             # The previous 1.8 gain plus the hysteresis threshold caused the
             # differential base to overshoot, re-enter turn-in-place, and stall
             # on long east/north/west bypass segments.
+            # 原夹 0.08 rad/s：一次对齐要 40s+（主人指出立省 2-4 分钟/轮）。
+            # 0.4：与 max_angular 默认同量级，翻转/对齐 8s 内完成。
+            _align_rate = float(os.getenv("SUPERMARKET_ALIGN_RATE", "0.4"))
             command.angular.z = max(
-                -min(self.max_angular, 0.08),
-                min(min(self.max_angular, 0.08), 0.5 * heading_error),
+                -min(self.max_angular, _align_rate),
+                min(min(self.max_angular, _align_rate), 0.5 * heading_error),
             )
             self._publish(command)
             self._periodic_log(
@@ -612,7 +616,8 @@ class LowSpeedNavigator(Node):
                 )
                 return
             command.linear.x = min(self.max_speed, self.drive_speed_gain * distance)
-            command.angular.z = max(-0.03, min(0.03, 0.08 * heading_error))
+            # 轴向直行的航向微调同样提速（0.08→0.4，主人指示）
+            command.angular.z = max(-0.4, min(0.4, 0.5 * heading_error))
             self._publish(command)
             self._periodic_log(
                 f"pickup-transit pos=({self.x:.2f},{self.y:.2f}) dist={distance:.2f} "
