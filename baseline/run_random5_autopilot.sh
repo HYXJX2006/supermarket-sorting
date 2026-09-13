@@ -238,8 +238,10 @@ fi
 # ArUco 货位识别（传统视觉，不需要训练）：官方 aruco_detect.py，
 # DICT_4X4_50 / marker_size 0.03m / --detect-scale 2（3cm 码放 2 倍后更好检）。
 # 发布 /aruco/head/ids，供 executor 把"商品 kind ↔ 货位"绑定到布局真值上。
+# ⚠️ 必须 --image-topic-mode native：默认 color 读的是 3DGS 渲染图，里面
+# 没有 ArUco 格子（GS 不带 MJCF 纹理），实测会一直 no valid markers。
 python3 -u /workspace/baseline/official_baseline/examples/supermarket_sorting/perception/aruco_detect.py \
-    --cameras head --marker-size 0.03 --detect-scale 2 --no-tf > /tmp/aruco_detect.log 2>&1 &
+    --cameras head --marker-size 0.03 --detect-scale 2 --no-tf --image-topic-mode native > /tmp/aruco_detect.log 2>&1 &
 ARUCO_PID=\$!
 trap 'kill \$DET_PID \$ARUCO_PID 2>/dev/null || true' EXIT
 sleep 1
