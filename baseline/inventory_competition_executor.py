@@ -197,10 +197,13 @@ TRACK_STABILITY_WINDOW = max(6, _env_int("SUPERMARKET_TRACK_STABILITY_WINDOW", 8
 #   deploy 降到同高 → servo① 左右校准（罐子完整可见，防止进深时指头顶歪
 #   罐子——实测罐子被顶成 57-68° 斜躺后无法抓取）→ creep 进深 → servo②
 #   抓取面微调（修正进深漂移）→ close（夹空则 +1.5cm 深度探测再循环）。
-# 伺服步骤已移除（主人 09-13 定案"纯恶心人"）：手眼伺服三连败——
-# HSV 锁到相邻红柱抓歪、垂直 9cm 修不完挂死、超时触发 IK 不可达的重部署。
-# 纯 deploy(IK) + creep(末端三轴闭环) 的开环链实测更稳。
-ARM_ACTIONS = ("safe_pose", "deploy", "servo", "creep", "servo", "close_gripper", "lift", "retreat", "slide_reset")
+# 2026-09-13 定案：砍掉 pre-creep 的那次伺服（原顺序
+# safe_pose→deploy→servo①→creep→servo②→close 里 servo① 在 standoff 0.31m
+# 处测，商品根本不在画面中心/画面内，日志里它常年只报 0.4~1.0cm 甚至
+# "画面内无合格团块"），且每次伺服实测耗 42s（等头相机新帧，6fps+GS 渲染）。
+# 现在与上面注释里的设计一致：deploy（降到同高）→ creep（进深，末端三轴闭环）
+# → servo（抓取面微调/横向校准）→ close。
+ARM_ACTIONS = ("safe_pose", "deploy", "creep", "servo", "close_gripper", "lift", "retreat", "slide_reset")
 POST_PLACE_SAFE_POSE = "post_place_safe_pose"
 # 手眼伺服：偏差超过 SERVO_APPLY_THRESHOLD 则带修正量回退重部署；
 # 最多 SERVO_RETRY_MAX 次（每次部署 ~20s，比赛时限内可承受）。
@@ -2292,15 +2295,17 @@ class InventoryCompetitionExecutor(Node):
                 self.arm_index += 1
                 self._start_arm_action()
                 return
-            if action_now == "close_gripper" and self.depth_probe_count < 4:
+            if action_now == "close_gripper" and self.depth_probe_count < 2:
                 # 闭爪落空（夹空检测拦截）→ 伸入深度不足的强反馈：
-                # 停止线 +3cm 再 creep→close，最多探测 3 次。
+                # 停止线 +1.5cm 再 creep→close。上限 2 次（2026-09-13 从 4 收到 2）：
+                # 每轮探测含一次 servo（~42s 仿真时间），4 轮就把 420s 预算烧掉一半，
+                # 实测也没救回目标；2 轮不上就交给"拉黑该槽位换候选"的链路。
                 self.depth_probe_count += 1
                 # 步长 1.5cm：+3cm 步长实测在最优深度两侧跳变
                 # （+3cm 时 feedback 0.32 部分接触、+6cm 回落 0.08 全空）
                 self._servo_depth_extra = (self._servo_depth_extra or 0.0) + 0.015
                 self.get_logger().warning(
-                    f"[exec] 闭爪落空，深度探测 {self.depth_probe_count}/3："
+                    f"[exec] 闭爪落空，深度探测 {self.depth_probe_count}/2："
                     f"creep 停止线 +1.5cm（累计 +{(self._servo_depth_extra) * 100:.1f}cm）"
                 )
                 self._publish_grasp_meta(target)
