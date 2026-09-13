@@ -54,8 +54,6 @@ ARUCO_IDS_TOPIC = os.getenv("SUPERMARKET_ARUCO_IDS_TOPIC", "/aruco/head/ids")
 # ArUco 吸附开关与容差：只有当前货位码被看到、且视觉坐标与货位名义坐标
 # 相差在容差内时才吸附（防止看错相邻货位）。x/z 用布局真值（层高已知、
 # 列间距 0.22m 也已知），y 仍用视觉（深度是唯一能测进深的来源）。
-USE_ARUCO_SLOT = _env_float("SUPERMARKET_USE_ARUCO_SLOT", 1.0) > 0.0
-ARUCO_SNAP_TOL_M = _env_float("SUPERMARKET_ARUCO_SNAP_TOL_M", 0.08)
 PLACE_STATUS_TOPIC = "/competition/place_status"
 INVENTORY_TOPIC = "/competition/inventory_map"
 FLOW_STATUS_TOPIC = "/competition/inventory_flow_status"
@@ -74,6 +72,12 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return float(default)
+
+
+# ArUco 吸附开关与容差（必须放在 _env_float 定义之后，否则 import 即
+# NameError：2026-09-13 实测编排器一启动就 exit 1）。
+USE_ARUCO_SLOT = _env_float("SUPERMARKET_USE_ARUCO_SLOT", 1.0) > 0.0
+ARUCO_SNAP_TOL_M = _env_float("SUPERMARKET_ARUCO_SNAP_TOL_M", 0.08)
 
 
 def _env_int(name: str, default: int) -> int:
