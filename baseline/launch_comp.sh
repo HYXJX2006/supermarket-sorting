@@ -45,9 +45,13 @@ EXTRA_ENV=()
 [ -n "$SERVO_LATERAL_GAIN" ] && EXTRA_ENV+=("SUPERMARKET_SERVO_LATERAL_GAIN=$SERVO_LATERAL_GAIN")
 [ -n "$ARM_LATERAL_OFFSET" ] && EXTRA_ENV+=("SUPERMARKET_ARM_LATERAL_OFFSET_M=$ARM_LATERAL_OFFSET")
 
-env SUPERMARKET_TASKS="$TASKS" SUPERMARKET_TASK_COUNT="$COUNT" SUPERMARKET_SEED="$SEED" \
-  "${EXTRA_ENV[@]}" \
-  setsid nohup bash "$SCRIPT" >> "$LOG" 2>&1 < /dev/null &
+# 注意：不要写 `env ... "${EXTRA_ENV[@]}" ...`——数组只有一个元素时
+# bash 会把空展开也塞进去，实测把 -0.20 吞成了默认值。直接 export。
+export SUPERMARKET_TASKS="$TASKS" SUPERMARKET_TASK_COUNT="$COUNT" SUPERMARKET_SEED="$SEED"
+for _kv in "${EXTRA_ENV[@]}"; do
+  [ -n "$_kv" ] && export "$_kv"
+done
+setsid nohup bash "$SCRIPT" >> "$LOG" 2>&1 < /dev/null &
 echo "launched pid=$! tasks=$TASKS count=$COUNT seed=$SEED log=$LOG"
 echo "旋钮: ARM_LATERAL_OFFSET=${ARM_LATERAL_OFFSET:-默认-0.02}  GRASP_Z_OFFSET=${GRASP_Z_OFFSET:-默认-0.02}  SERVO_LATERAL_GAIN=${SERVO_LATERAL_GAIN:-默认}"
 sleep 3
