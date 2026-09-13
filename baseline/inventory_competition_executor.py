@@ -151,11 +151,11 @@ Z_LEVEL_CLAMP_M = _env_float("SUPERMARKET_Z_LEVEL_CLAMP_M", 0.025)
 # （servo 只写 j3，结果里 height 恒为 +0.0cm），于是指头停在商品上方悬空
 # （主人目视确认）。这里把高度钉在"该货位层高 LEVEL_Z + 偏置"上，视觉 z 只当参考。
 GRASP_Z_OFFSET_M = _env_float("SUPERMARKET_GRASP_Z_OFFSET_M", -0.02)
-# 抓取横向（左右）偏置：现场可调的"整体左移/右移"旋钮（m，负=往西/往左）。
+# 抓取横向（左右）偏置：现场可调的"整体左移/右移"旋钮（m，负=往西/往左；默认 -0.06）。
 # 背景：主人实测每次抓取机械臂都向左偏 4~5cm，而手眼伺服的横向 j3 修正
 # 已被证明不可靠（同帧重复、残差 ±2.6cm 纹丝不动、两档增益都发散），
 # 所以横向改走"开环偏置补偿"这条确定的路径：直接把目标 x 平移。
-ARM_LATERAL_OFFSET_M = _env_float("SUPERMARKET_ARM_LATERAL_OFFSET_M", -0.02)
+ARM_LATERAL_OFFSET_M = _env_float("SUPERMARKET_ARM_LATERAL_OFFSET_M", -0.06)
 # 跳巡游扫描：比赛时限 420s，而 E→D→C→B→A 全扫描实测要 5-8 分钟。
 # 任务清单（目标 kind）与 45 槽位布局都是已知的，可直接用布局真值预填地图
 # 并立即进入执行阶段，把扫描时间全部省掉。
@@ -209,6 +209,10 @@ SERVO_RESULT_PATH = "debug_data/servo_result.json"
 # 与"6.5cm 罐身可容忍的横向偏差"匹配，小残差直接闭爪。
 SERVO_APPLY_THRESHOLD = _env_float("SUPERMARKET_SERVO_APPLY_THRESHOLD", 0.015)
 SERVO_RETRY_MAX = int(_env_float("SUPERMARKET_SERVO_RETRY_MAX", 2))
+# 竖直伺服闭环开关（2026-09-13 主人决定：删掉竖直，只调水平）。
+# 竖直走"层高锚定 + 现场偏置"的开环即可；伺服竖直量噪声大（±6cm 跳变）
+# 且每次重部署要 ~55s 仿真时间，比赛 420s 预算下不划算。
+SERVO_VERTICAL_LOOP = _env_float("SUPERMARKET_SERVO_VERTICAL_LOOP", 0.0) > 0.0
 WORKER_CFG = {
     "servo": ("hand_eye_servo_controller.py", ["--execute", "--confirm", "servo", "--timeout", "40"]),
     # 伺服重部署序列：先退 30cm 让手完全脱离货架前沿，再抬手退出格子，
@@ -1114,6 +1118,8 @@ class InventoryCompetitionExecutor(Node):
 
     def _note_servo_height_error(self, measured: bool) -> bool:
         """消费伺服测到的竖直残差；需要重部署时返回 True。"""
+        if not SERVO_VERTICAL_LOOP:
+            return False
         if not measured:
             return False
         try:
